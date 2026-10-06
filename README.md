@@ -47,3 +47,28 @@ and course checks C01-C23:
 
 The contract validator reads `hws_descriptions/hw1/hw01_contract.yaml`
 directly and requires Ruby's standard YAML library.
+
+## Run the official course checker
+
+The repository already contains a working `hw01_submission.yaml` for the current local setup.
+
+Run the part of the official checker that is already implemented and expected to pass:
+
+```sh
+uv run python hws_descriptions/hw1/hw01_check.py \
+  --submission ./hw01_submission.yaml \
+  --sections contract,keys,dq,inv \
+  --skip-exec \
+  -v
+```
+
+The checker requires the Python dependencies declared in `pyproject.toml` (`PyYAML` and `psycopg2-binary`), so run it through `uv` as shown above.
+
+This command has already been executed successfully on the current implementation. The result was fully green for the implemented sections:
+
+- contract views: 14/14;
+- contract nullability and uniqueness: 27/27;
+- data-quality checks C01-C23: 23/23;
+- invariants I1-I12 and positive tests P1/P2: 14/14.
+
+The remaining checker sections (`volume`, `cross`, `repl`, `cdc`, `ha`, `realism`) are not expected to pass yet because the seed generator, assignment-scale dataset, replication, CDC, and HA layers have not been implemented yet.

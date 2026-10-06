@@ -7,7 +7,10 @@ authors = [
     { name = "blenlkj", email = "sblenlkj@gmail.com" }
 ]
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "psycopg2-binary>=2.9.9",
+    "PyYAML>=6.0",
+]
 
 [project.scripts]
 pharmacy-dwh = "pharmacy_dwh:main"
