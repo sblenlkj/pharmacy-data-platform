@@ -33,6 +33,10 @@
 
 Именно эти BK считаются integration identity. Суррогатные ID внутри сервисных БД наружу не используются.
 
+Формат BK (текстовый namespaced ключ с namespace порции генерации; BK
+справочников выводится из имени) и отвергнутые альтернативы зафиксированы в
+[ADR 008](adr/008-business-key-format.md).
+
 ## 3. Изменяющиеся атрибуты
 
 | сущность | атрибут | меняется | история хранится | зачем нужна история |
@@ -69,22 +73,24 @@
 
 Все contract views отдают `updated_at`; в базовых таблицах оно обновляется автоматически.
 
-| представление контракта | поле инкремента | как отслеживаются удаления | ожидаемый объём суточного дельта |
+Объёмы дельты измерены на базовом seed (`--seed 42`, `BASE_SCALE`). Факты равномерно размазаны по окну 548 суток, поэтому дельта = `count / 548`; для version-таблиц взята интенсивность появления версий на их собственном разбросе дат; справочники в seed статичны.
+
+| представление контракта | поле инкремента | как отслеживаются удаления | ожидаемый объём суточного дельта, строк/сутки |
 |---|---|---|---|
-| `crm.v_customer` | `updated_at` | customer soft delete скрывает строку из view; для CDC нужен tombstone/обработка delete-события базовой таблицы | низкий/средний |
-| `crm.v_loyalty_card` | `updated_at` | статус/закрытие; физического delete не требуется | низкий |
-| `catalog.v_sku` | `updated_at` | soft-deleted SKU остаётся в contract с `is_active=false` | низкий |
-| `catalog.v_price` | `updated_at` | интервалы закрываются UPDATE; новые версии — INSERT | средний |
-| `pos.v_pharmacy` | `updated_at` | soft delete остаётся как `is_active=false` | низкий |
-| `pos.v_receipt` | `updated_at` | факты не удаляются; новые документы — INSERT | высокий |
-| `pos.v_receipt_line` | `updated_at` | факты не удаляются | высокий |
-| `pos.v_payment` | `updated_at` | факты не удаляются | высокий |
-| `wms.v_supplier` | `updated_at` | soft delete остаётся как `is_active=false` | низкий |
-| `wms.v_distribution_center` | `updated_at` | soft delete остаётся как `is_active=false` | низкий |
-| `wms.v_batch` | `updated_at` | партии не удаляются | средний |
-| `wms.v_purchase_line` | `updated_at` | факт закупки сохраняется | средний |
-| `wms.v_movement` | `updated_at` | movement immutable; correction = compensating movement | высокий |
-| `wms.v_stock` | `updated_at` | текущее состояние обновляется движениями | высокий |
+| `crm.v_customer` | `updated_at` | customer soft delete скрывает строку из view; для CDC нужен tombstone/обработка delete-события базовой таблицы | ≈5 (обновления профиля ≈2, смена marketing_opt_in ≈3; новые регистрации ≈0) |
+| `crm.v_loyalty_card` | `updated_at` | статус/закрытие; физического delete не требуется | ≈2 (выпуск/перевыпуск ≈1,5, статус-переходы) |
+| `catalog.v_sku` | `updated_at` | soft-deleted SKU остаётся в contract с `is_active=false` | ≈2 (новые версии атрибутов; новые SKU ≈0) |
+| `catalog.v_price` | `updated_at` | интервалы закрываются UPDATE; новые версии — INSERT | ≈4 новые версии (×2 строки с UPDATE-закрытием предыдущей) |
+| `pos.v_pharmacy` | `updated_at` | soft delete остаётся как `is_active=false` | ≈0 (справочник статичен) |
+| `pos.v_receipt` | `updated_at` | факты не удаляются; новые документы — INSERT | ≈39 |
+| `pos.v_receipt_line` | `updated_at` | факты не удаляются | ≈116 |
+| `pos.v_payment` | `updated_at` | факты не удаляются | ≈43 |
+| `wms.v_supplier` | `updated_at` | soft delete остаётся как `is_active=false` | ≈0 (справочник статичен) |
+| `wms.v_distribution_center` | `updated_at` | soft delete остаётся как `is_active=false` | ≈0 (справочник статичен) |
+| `wms.v_batch` | `updated_at` | партии не удаляются | ≈6 |
+| `wms.v_purchase_line` | `updated_at` | факт закупки сохраняется | ≈10 |
+| `wms.v_movement` | `updated_at` | movement immutable; correction = compensating movement | ≈168 |
+| `wms.v_stock` | `updated_at` | текущее состояние обновляется движениями | ≈215 (приход и списание на продаже трогают одну строку stock — внешний supplier/customer её не имеет, перемещение — две) |
 
 Важно: для `v_customer` одной watermark-выгрузки по view недостаточно, потому что после soft delete строка исчезает из view. В CDC-потоке это должно обрабатываться по изменению базовой `customer` и доменной семантике удаления/обезличивания.
 
@@ -110,7 +116,7 @@ Publication и replica identity настраиваются в `scripts/infra/boo
 5. **Нет прямой связи purchase → movement.** Закупка и складское движение связываются через `batch_bk`: `purchase_line.batch_bk -> batch -> movement.batch_bk`. Для текущего HW этого достаточно, но в DWH нельзя без дополнительной логики однозначно считать каждый `movement` частью конкретного `purchase_bk`, особенно если у партии несколько движений.
 6. **Семантика удаления customer отличается от остальных master-data.** Customer исчезает из `contract.v_customer`, а остальные soft-deleted master/reference entities остаются в contract с неактивным статусом. CDC/DWH должен обрабатывать эти два сценария по-разному.
 7. **`marketing_opt_in` — производное текущее состояние consent.** История согласий хранится в CRM, но contract отдаёт итоговый признак. Для исторической аналитики согласий нужно использовать базовые consent-события/CDC, а не только текущее значение из `v_customer`.
-8. **Текущий seed не демонстрирует все типы изменений.** Delta добавляет новый namespace и хорошо проверяет репликацию, но почти не показывает UPDATE существующих бизнес-сущностей.
+8. **Delta-порции добавляют новые namespace, а не меняют существующие сущности.** Базовый seed демонстрирует CRM-жизнь (soft-deleted клиенты, отозванные и перевыпущенные согласия, перевыпуски карт) и смену версий SKU/цен, но delta-догенерация создаёт только новые сущности; UPDATE-поток существующих строк в репликации она почти не показывает.
 
 ## 8. Заготовка витрин ДЗ3
 

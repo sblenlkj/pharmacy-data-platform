@@ -1,3 +1,8 @@
+-- I4: арифметика и знаки строки чека.
+-- Сущность: pos.receipt_line.
+-- Условие: line_discount (11) больше суммы строки quantity * unit_price (1 * 10 = 10);
+-- нарушение CHECK (line_discount <= quantity * unit_price) → 23514 на INSERT позиции.
+
 INSERT INTO pharmacy VALUES
 ('PH-I04', 'I04 Pharmacy', 'Region', 'City', 'Address', '2020-01-01', NULL, true, NULL, DEFAULT, DEFAULT);
 INSERT INTO cash_register (register_bk, pharmacy_bk) VALUES ('REG-I04', 'PH-I04');
