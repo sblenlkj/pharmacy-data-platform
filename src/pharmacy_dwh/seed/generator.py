@@ -186,6 +186,9 @@ class Generator:
             level_ids = ids_by_name(cur, "loyalty_level", "level_name")
             contact_ids = ids_by_name(cur, "contact_type", "type_name")
             consent_ids = ids_by_name(cur, "consent_type", "type_name")
+            reserved = min(200, self.scale.customers // 11)
+            eligible = self.scale.customers - reserved
+            soft_delete_count = 0 if self.settings.delta else min(150, reserved)
             customers = []
             profiles = []
             contacts = []
@@ -215,12 +218,27 @@ class Generator:
                 consents.append((f"CONSENT-{self.ns}-{i:06d}-P", bk, consent_ids["personal_data"],
                                  registered, None, self.audit_ts, self.audit_ts))
                 if i % 5:
+                    marketing_issued = registered + timedelta(days=1)
+                    marketing_revoked = (
+                        marketing_issued + timedelta(days=90) if i % 4 == 0 else None
+                    )
                     consents.append((f"CONSENT-{self.ns}-{i:06d}-M", bk, consent_ids["marketing"],
-                                     registered + timedelta(days=1), None, self.audit_ts, self.audit_ts))
+                                     marketing_issued, marketing_revoked, self.audit_ts, self.audit_ts))
+                    if marketing_revoked is not None and i % 8 == 0:
+                        consents.append((f"CONSENT-{self.ns}-{i:06d}-M2", bk, consent_ids["marketing"],
+                                         marketing_revoked + timedelta(days=30), None,
+                                         self.audit_ts, self.audit_ts))
                 if i <= self.scale.cards:
                     issued = registered + timedelta(days=2)
-                    cards.append((f"CARD-{self.ns}-{i:06d}", bk, issued, None, "active",
-                                  _money(Decimal((i * 37) % 5000) / 10), self.audit_ts, self.audit_ts))
+                    if i % 9 == 0:
+                        closed = issued + timedelta(days=400)
+                        cards.append((f"CARD-{self.ns}-{i:06d}", bk, issued, closed, "closed",
+                                      _money(Decimal((i * 37) % 5000) / 10), self.audit_ts, self.audit_ts))
+                        cards.append((f"CARD-{self.ns}-{i:06d}-R", bk, closed + timedelta(days=1),
+                                      None, "active", Decimal("0.00"), self.audit_ts, self.audit_ts))
+                    else:
+                        cards.append((f"CARD-{self.ns}-{i:06d}", bk, issued, None, "active",
+                                      _money(Decimal((i * 37) % 5000) / 10), self.audit_ts, self.audit_ts))
             insert_rows(cur, """
                 INSERT INTO customer
                     (customer_bk, birth_year, sex, registered_at, created_at, updated_at)
@@ -249,8 +267,23 @@ class Generator:
                      created_at, updated_at)
                 VALUES %s ON CONFLICT DO NOTHING
             """, cards)
-        self.ctx.customers = [row[0] for row in customers]
-        return {"crm.customer": len(customers), "crm.loyalty_card": len(cards)}
+            if soft_delete_count:
+                victims = [row[0] for row in customers[eligible:eligible + soft_delete_count]]
+                cur.execute(
+                    """
+                    UPDATE customer
+                       SET deleted_at = %(deleted_at)s
+                     WHERE customer_bk = ANY(%(victims)s)
+                       AND deleted_at IS NULL
+                    """,
+                    {"victims": victims,
+                     "deleted_at": self.start_ts + timedelta(days=400)},
+                )
+        self.ctx.customers = [row[0] for row in customers[:eligible]]
+        return {"crm.customer": len(customers), "crm.loyalty_card": len(cards),
+                "crm.customer_soft_deleted": soft_delete_count,
+                "crm.consent_revoked": sum(1 for c in consents if c[4] is not None),
+                "crm.card_reissued": sum(1 for c in cards if c[0].endswith("-R"))}
 
     def _pos_master(self) -> dict[str, int]:
         regions = (("Moscow", "Moscow"), ("Tatarstan", "Kazan"), ("Perm Krai", "Perm"),

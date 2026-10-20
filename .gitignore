@@ -15,6 +15,10 @@ wheels/
 *results*.txt
 AGENTS.md
 
+# Private working notes — never commit (checklists, reviews, work logs)
+/hw01_checklist.md
+/review_*.md
+
 # Local credentials and generated diagnostics
 .env
 reports/*
