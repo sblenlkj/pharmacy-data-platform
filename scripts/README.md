@@ -1,6 +1,6 @@
 # Scripts
 
-Эта папка содержит пользовательские entrypoints и Python orchestration для HW1.
+Эта папка содержит пользовательские entrypoints и Python orchestration для ДЗ-1 и ДЗ-2.
 
 Идея разделения простая:
 
@@ -223,16 +223,60 @@ db-init
 
 Делает:
 
-1. создаёт роли `app` и `checker`;
+1. создаёт роли `app`, `checker` и `debezium` (LOGIN REPLICATION);
 2. создаёт 4 service DB;
 3. применяет `migrations/<service>/*.sql`;
 4. ведёт ledger применённых migrations с SHA-256;
-5. настраивает права;
-6. создаёт CDC publication;
+5. настраивает права (включая SELECT для роли `debezium` на таблицы CDC);
+6. создаёт CDC publication `hw01_all_tables` + publication'ы `pub_cdc_*`
+   по `scripts/infra/cdc_sources.json` (= dwh_mapping §9);
 7. настраивает `REPLICA IDENTITY`;
-8. проверяет наличие contract views.
+8. проверяет наличие contract views;
+9. если источники пусты — запускает базовый сид генератора (`DATA_SEED`,
+   по умолчанию 42) напрямую через `haproxy:5000`.
 
-Это основной bootstrap production-like стенда HW1.
+Это основной bootstrap production-like стенда HW1/HW2.
+
+---
+
+### `cdc_init.py`
+
+One-shot оркестратор CDC (ДЗ-2), сервис `cdc-init` (образ тот же,
+что у Kafka Connect: внутри есть python3-stdlib и kafka-cli).
+
+1. ждёт Kafka Connect REST;
+2. регистрирует (idempotent PUT) 4 коннектора Debezium `cdc-{svc}`:
+   `pgoutput`, `snapshot.mode=initial`, `topic.prefix` = сервис,
+   `table.include.list` из `cdc_sources.json`, лидер через `haproxy:5000`;
+3. ждёт RUNNING у connector/tasks и стабильные ненулевые end-offsets
+   всех 23 топиков `{svc}.public.{table}`;
+4. пишет в лог маркер `CDC SNAPSHOT DONE`.
+
+---
+
+### `wait_raw_caught_up.py` и `load_dds` (загрузчик DDS)
+
+Сервис `dwh-init` (образ `tools`, dbt-trino in-process) — начальная
+загрузка DDS после CDC SNAPSHOT DONE:
+
+- `wait_raw_caught_up.py` ждёт эквивалент маркера cdc-ingest
+  `CDC RAW CAUGHT UP`: водяные знаки Kafka (confluent-kafka) совпадают
+  с максимумами offsets в `raw.cdc_events` по всем 23 топикам;
+- `load_dds` (контракт `commands.load` чекера ДЗ-2, запуск и человеком):
+  - без аргументов — новая порция (batch_id=UUID), диапазоны
+    `[ctl.kafka_positions, max(raw))`;
+  - `--batch-id ID` — то же с переданным идентификатором;
+  - `--batch-id ID --replay` — применить сохранённые в `ctl.load_batches`
+    диапазоны; позиции не двигаются, строка порции не перезаписывается;
+  - затронутые топики → затронутые staging-модели → `dbt run --select
+    stg_x+ …` (in-process dbtRunner, target/log в /tmp — репозиторий ro);
+    первая порция (`ctl.load_batches` пуст) идёт с `--full-refresh`;
+  - успех → строка `ctl.load_batches(status=success)` + продвижение
+    `ctl.kafka_positions`; также пересинхронизирует `ctl.receipt_pharmacy`
+    (обогащение `pharmacy_bk` чека — маршрут shift → cash_register →
+    pharmacy вне репликации) из `pos.contract.v_receipt`.
+
+Механика порций и идемпотентность — ADR-011.
 
 ---
 

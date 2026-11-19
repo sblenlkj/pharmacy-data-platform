@@ -16,6 +16,29 @@ bootstrap:
     maximum_lag_on_failover: 1048576
     check_timeline: true
     synchronous_mode: false
+    # Логические слоты CDC (Debezium) объявлены постоянными: Patroni держит
+    # их на лидере и пересоздаёт на новом после смены лидера/рестарта
+    # кластера, иначе коннекторы падают «LSN no longer available».
+    # В Patroni 4.1 ключ динамической конфигурации permanent_slots
+    # читается только с верхнего уровня (bootstrap.dcs.permanent_slots);
+    # из секции postgresql он игнорируется.
+    permanent_slots:
+      cdc_crm:
+        type: logical
+        plugin: pgoutput
+        database: crm_service_db
+      cdc_catalog:
+        type: logical
+        plugin: pgoutput
+        database: catalog_service_db
+      cdc_pos:
+        type: logical
+        plugin: pgoutput
+        database: pos_service_db
+      cdc_wms:
+        type: logical
+        plugin: pgoutput
+        database: wms_service_db
     postgresql:
       use_pg_rewind: true
       use_slots: true

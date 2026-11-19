@@ -1,0 +1,138 @@
+%% ERD детального слоя ДЗ-2 (dimensional, ADR 009), синхронизирован с фактическими
+%% таблицами iceberg.dwh_detailed (DESCRIBE, прогон 2026-11-16).
+%% Соглашения:
+%%   timestamptz = timestamp(6) with time zone (точность 6 — ADR-010);
+%%   на каждой таблице dim/fact — аудит-колонки lineage (_load_batch_id,
+%%   _src_topic, _src_partition, _src_offset — dwh_mapping.md §10), опущены
+%%   для читаемости;
+%%   производные значения НЕ хранятся и вычисляются в представлениях контракта
+%%   (ADR-006/009): line_amount (v_sale_line), line_cost (v_purchase_line),
+%%   is_current (v_price_history), valid_to SKU-версий (v_sku_history, lead
+%%   по valid_from — ADR-011), поэтому их нет среди колонок таблиц.
+%% Техслой (raw/staging/ctl) — docs/erd/dds_tech.mmd.
+erDiagram
+    DIM_SKU ||--o{ DIM_SKU_VERSION : versions
+    DIM_SKU ||--o{ FACT_SALE_LINE : sold_as
+    DIM_SKU ||--o{ FACT_PURCHASE_LINE : ordered_as
+    DIM_SKU ||--o{ FACT_MOVEMENT : moves_as
+    DIM_SKU ||--o{ DIM_PRICE : priced
+    DIM_BATCH }o--|| DIM_SKU : belongs_to
+    DIM_BATCH ||--o{ FACT_SALE_LINE : from_batch
+    DIM_BATCH ||--o{ FACT_PURCHASE_LINE : from_batch
+    DIM_BATCH ||--o{ FACT_MOVEMENT : moves
+    DIM_PHARMACY ||--o{ FACT_SALE_LINE : sold_at
+    DIM_CUSTOMER |o--o{ FACT_SALE_LINE : buys
+    DIM_SUPPLIER ||--o{ FACT_PURCHASE_LINE : supplies
+    DIM_DISTRIBUTION_CENTER ||--o{ FACT_PURCHASE_LINE : receives
+    FACT_SALE_LINE |o--o| FACT_SALE_LINE : refunds
+
+    DIM_SKU {
+        varchar sku PK "SCD1-атрибуты; имя, категория, Rx — в DIM_SKU_VERSION"
+        varchar inn_name "агрегат M:N действующих веществ, как в catalog.v_sku"
+        varchar manufacturer_name
+        varchar drug_form
+        boolean is_vital
+        decimal(18,3) pack_qty
+        boolean is_active
+    }
+    DIM_SKU_VERSION {
+        varchar sku PK
+        timestamptz valid_from PK
+        varchar sku_name
+        varchar category
+        boolean is_rx
+    }
+    DIM_PRICE {
+        varchar sku PK
+        varchar price_scope PK
+        varchar scope_bk PK
+        timestamptz valid_from PK
+        decimal(18,2) price
+        varchar currency
+        timestamptz valid_to "NULL = открыта; приходит событием закрытия (ADR-011)"
+    }
+    DIM_CUSTOMER {
+        varchar customer_bk PK
+        integer birth_year
+        varchar sex
+        varchar city
+        varchar region
+        varchar loyalty_level
+        boolean marketing_opt_in
+        timestamptz registered_at
+        timestamptz deleted_at "soft delete; скрывает из v_customer, чеки остаются"
+    }
+    DIM_PHARMACY {
+        varchar pharmacy_bk PK
+        varchar pharmacy_name
+        varchar region
+        varchar city
+        varchar address
+        date opened_at
+        date closed_at
+        boolean is_active
+    }
+    DIM_BATCH {
+        varchar batch_bk PK
+        varchar sku FK
+        varchar series_no
+        date manufactured_date
+        date expiry_date
+        timestamptz received_at
+    }
+    DIM_SUPPLIER {
+        varchar supplier_bk PK
+        varchar supplier_name
+        varchar country
+        boolean is_active
+    }
+    DIM_DISTRIBUTION_CENTER {
+        varchar dc_bk PK
+        varchar dc_name
+        varchar region
+        varchar city
+        boolean is_active
+    }
+    FACT_SALE_LINE {
+        varchar receipt_bk PK
+        integer line_no PK
+        varchar sku FK
+        varchar batch_bk FK
+        decimal(18,3) quantity
+        decimal(18,2) unit_price
+        decimal(18,2) line_discount
+        boolean is_rx_snapshot "снимок на момент продажи"
+        varchar sku_name_snapshot "снимок на момент продажи"
+        varchar pharmacy_bk FK
+        varchar customer_bk FK "NULL после soft delete в v_sale_line"
+        timestamptz receipt_dt "партиция month(receipt_dt)"
+        varchar doc_type "sale | refund"
+        varchar parent_receipt_bk "для возврата"
+        varchar currency
+    }
+    FACT_PURCHASE_LINE {
+        varchar purchase_bk PK
+        integer line_no PK
+        varchar supplier_bk FK
+        varchar dc_bk FK
+        varchar sku FK
+        varchar batch_bk FK "NULL — приход ещё не привязан"
+        timestamptz ordered_at "партиция month(ordered_at)"
+        timestamptz received_at "из batch"
+        decimal(18,3) quantity
+        decimal(18,2) unit_cost
+        varchar currency
+    }
+    FACT_MOVEMENT {
+        varchar movement_bk PK
+        varchar batch_bk FK
+        varchar sku FK "из batch"
+        varchar movement_type
+        varchar src_type "dc | pharmacy | supplier | NULL"
+        varchar src_bk
+        varchar dst_type "dc | pharmacy | customer | supplier | NULL"
+        varchar dst_bk "NULL после soft delete клиента в v_movement"
+        decimal(18,3) qty
+        timestamptz dispatched_at
+        timestamptz moved_at "партиция month(moved_at)"
+    }

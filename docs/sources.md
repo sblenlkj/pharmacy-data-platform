@@ -55,6 +55,42 @@ PostgreSQL 16:
 - PostgreSQL 16 publications:
   https://www.postgresql.org/docs/16/logical-replication-publication.html
 
+## Инфраструктурная часть ДЗ-2 (лейкхаус, CDC, загрузка DDS)
+
+Также сверялись с официальной документацией (готовых рецептов не заимствовали;
+конфиги писали сами, по ссылкам — сверка свойств и ограничений):
+
+- dbt-trino 1.12 (адаптер Trino для dbt-core 1.12; инкрементальные модели,
+  merge-стратегия, profiles для Trino):
+  https://github.com/dbt-labs/dbt-trino
+  https://docs.getdbt.com/docs/connect-adapters/connect-trino
+- Debezium 3.7 PostgreSQL-коннектор: слоты, publication'ы, snapshot.mode,
+  `offset.mismatch.strategy=trust_slot` (возобновление с позиции слота после
+  его пересоздания — без повторного снапшота; свойство изучено по исходникам
+  тега v3.7.0.Final):
+  https://debezium.io/documentation/reference/3.7/connectors/postgresql.html
+  https://github.com/debezium/debezium/tree/v3.7.0.Final
+- Официальный реестр образов Debezium после ухода из Docker Hub:
+  https://quay.io/repository/debezium/connect
+- Trino 484, коннектор Iceberg: каталог через Hive Metastore + S3 (MinIO),
+  MERGE, партиционирование:
+  https://trino.io/docs/current/connector/iceberg.html
+- Образ apache/hive 4.0.1 (standalone metastore; добавление JDBC/S3-jar'ов
+  в образ, hive-site.xml):
+  https://hub.docker.com/r/apache/hive
+- Образ bitnamilegacy/minio (официальный minio/minio удалён из Docker Hub
+  в сентябре 2026; bitnami-legacy поддерживает актуальные теги, данные
+  кладёт в /bitnami/minio/data):
+  https://hub.docker.com/r/bitnamilegacy/minio
+- Образ apache/kafka 4.3.1 (KRaft single-node, переменные окружения для
+  комбинированного broker+controller):
+  https://hub.docker.com/r/apache/kafka
+- Patroni `permanent_slots` — постоянные репликационные слоты (пересоздание
+  логических слотов CDC на новом лидере; в Patroni 4.1 ключ динамической
+  конфигурации читается с верхнего уровня — сверено с установленным кодом
+  4.1.0 в образе):
+  https://patroni.readthedocs.io/en/latest/yaml_configuration.html
+
 ## Статус проверки
 
 Сборка образов, запуск кластера, миграции, генерация данных, SQL-права,

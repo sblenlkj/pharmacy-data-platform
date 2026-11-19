@@ -1,0 +1,4 @@
+# librdkafka из wheel confluent-kafka совместим с брокером apache/kafka:4.3.1
+# (KRaft).
+confluent-kafka==2.16.1
+trino==0.340.0

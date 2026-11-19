@@ -1,0 +1,57 @@
+version: 1
+
+# Вариант для запуска checker внутри сети Compose (сервисные имена вместо
+# localhost). Переменные окружения задаёт сервис tools в docker-compose.yml.
+team:
+  members:
+  - Каневский Дмитрий
+  - Бичурина Елизавета
+  - Кауров Александр
+  - Ляхов Артем
+  github_logins: [sblenlkj, lizzz33, lexbrown, ArtemLiA]
+  solo: false
+
+sources:
+  crm: HW02_CRM_DSN
+  catalog: HW02_CATALOG_DSN
+  pos: HW02_POS_DSN
+  wms: HW02_WMS_DSN
+
+target:
+  engine: trino
+  host: trino
+  port: 8080
+  user: checker
+  catalog: iceberg
+  http_scheme: http
+
+kafka:
+  bootstrap_servers: kafka:29092
+  topics:
+    crm.public.customer: {service: crm, table: public.customer}
+    crm.public.customer_profile_version: {service: crm, table: public.customer_profile_version}
+    crm.public.loyalty_level: {service: crm, table: public.loyalty_level}
+    crm.public.consent: {service: crm, table: public.consent}
+    crm.public.consent_type: {service: crm, table: public.consent_type}
+    catalog.public.sku: {service: catalog, table: public.sku}
+    catalog.public.sku_version: {service: catalog, table: public.sku_version}
+    catalog.public.sku_category: {service: catalog, table: public.sku_category}
+    catalog.public.manufacturer: {service: catalog, table: public.manufacturer}
+    catalog.public.drug_form: {service: catalog, table: public.drug_form}
+    catalog.public.active_ingredient: {service: catalog, table: public.active_ingredient}
+    catalog.public.sku_active_ingredient: {service: catalog, table: public.sku_active_ingredient}
+    catalog.public.price_version: {service: catalog, table: public.price_version}
+    catalog.public.price_scope: {service: catalog, table: public.price_scope}
+    pos.public.pharmacy: {service: pos, table: public.pharmacy}
+    pos.public.receipt: {service: pos, table: public.receipt}
+    pos.public.receipt_line: {service: pos, table: public.receipt_line}
+    wms.public.supplier: {service: wms, table: public.supplier}
+    wms.public.distribution_center: {service: wms, table: public.distribution_center}
+    wms.public.purchase_order: {service: wms, table: public.purchase_order}
+    wms.public.batch: {service: wms, table: public.batch}
+    wms.public.purchase_line: {service: wms, table: public.purchase_line}
+    wms.public.movement: {service: wms, table: public.movement}
+
+commands:
+  fixture: [./scripts/check_fixture]
+  load: [./scripts/load_dds]

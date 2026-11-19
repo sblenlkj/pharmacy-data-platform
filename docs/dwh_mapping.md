@@ -126,3 +126,54 @@ Publication и replica identity настраиваются в `scripts/infra/boo
 | Доставка по складам: дата, склад, число заказов, объём, среднее время обработки, задержки, уникальные заказчики | `moved_at`, `dispatched_at`, `src/dst`, `qty`, `batch_bk`, `sku`, связанная закупка/локация | WMS `v_movement`, `v_batch`, `v_purchase_line`, `v_distribution_center`; pharmacy при необходимости из POS. Связь movement с purchase восстанавливается через `batch_bk`. |
 
 Ограничение второй витрины: текущая source-модель не хранит прямой `purchase_bk` в movement, поэтому связь движения с закупкой восстанавливается через batch и purchase_line. Это допустимо для текущей модели, но является интеграционным trade-off.
+
+---
+
+# Дополнение ДЗ-2: карта склейки raw → DDS
+
+Модель DDS — dimensional (звезда, SCD2), обоснование —
+[ADR 009](adr/009-dds-model.md). Топик = `<сервис>.<schema>.<таблица>`
+(префикс коннектора Debezium равен коду сервиса). Ключ Kafka — PK
+физической таблицы. Слой raw — `raw.cdc_events` (Iceberg, append-only,
+координаты `(topic, partition_id, kafka_offset)`), см.
+[ADR 010](adr/010-lakehouse-engine-partitioning.md).
+
+## 9. Сущности и маршруты загрузки
+
+| Сущность / атрибут | Основной источник | Физическая таблица и ключ Kafka | Топик / raw | Таблица DDS и ключ | Представление и поле контракта |
+|---|---|---|---|---|---|
+| Позиция чека и атрибуты заголовка | POS | `receipt_line (receipt_bk, line_no)`; заголовок `receipt (receipt_bk)` | `pos.public.receipt_line`, `pos.public.receipt` | `fact_sale_line (receipt_bk, line_no)` | `v_sale_line`: все поля; заголовочные `pharmacy_bk`, `customer_bk`, `receipt_dt`, `doc_type`, `parent_receipt_bk`, `currency` — из события `receipt` |
+| Строка закупки | WMS | `purchase_line (purchase_bk, line_no)`; заголовок `purchase_order (purchase_bk)`; `received_at` — из `batch (batch_bk)` | `wms.public.purchase_line`, `wms.public.purchase_order` | `fact_purchase_line (purchase_bk, line_no)` | `v_purchase_line`: `supplier_bk`, `dc_bk`, `ordered_at` — из события `purchase_order` |
+| Движение партии | WMS | `movement (movement_bk)`; `sku` — из `batch (batch_bk)` | `wms.public.movement`, `wms.public.batch` | `fact_movement (movement_bk)` | `v_movement`: `sku` — справочник партий |
+| Товар и история | Каталог | `sku (sku_bk)`, `sku_version (id)`, `sku_category (id)`, `manufacturer (manufacturer_bk)`, `drug_form (drug_form_bk)`, `active_ingredient (ingredient_bk)`, `sku_active_ingredient (sku_bk, ingredient_bk)` | `catalog.public.*` (7 топиков выше) | `dim_sku (sku)` — SCD1-атрибуты; `dim_sku_version (sku, valid_from)` — единственный носитель имени/категории/Rx | `v_sku` — SCD1-атрибуты + открытая версия `dim_sku_version`; `v_sku_history` — версии имени, категории, Rx |
+| Версии цен и область действия | Каталог | `price_version (id)`, `price_scope (id)` | `catalog.public.price_version`, `catalog.public.price_scope` | `dim_price (sku, price_scope, scope_bk, valid_from)` | `v_price_history` — интервалы по области действия |
+| Клиент и soft delete | CRM | `customer (customer_bk)`, `customer_profile_version (id)`, `loyalty_level (id)`, `consent (consent_bk)`, `consent_type (id)` | `crm.public.*` (5 топиков выше) | `dim_customer (customer_bk)` | `v_customer`: `deleted_at IS NOT NULL` скрывает строку; `marketing_opt_in` — из consent-событий |
+| Аптека | POS | `pharmacy (pharmacy_bk)` | `pos.public.pharmacy` | `dim_pharmacy (pharmacy_bk)` | `v_pharmacy` |
+| Партия, поставщик и РЦ | WMS | `batch (batch_bk)`, `supplier (supplier_bk)`, `distribution_center (dc_bk)` | `wms.public.batch`, `wms.public.supplier`, `wms.public.distribution_center` | `dim_batch (batch_bk)`, `dim_supplier (supplier_bk)`, `dim_distribution_center (dc_bk)` | `v_batch`, `v_supplier`, `v_distribution_center` |
+
+Исключения Debezium (в CDC не реплицируются): `crm.customer_contact`,
+`crm.contact_type` (контактные данные остаются в CRM по требованию
+приватности), `crm.loyalty_card` (карты лояльности в ДЗ-2 пропускаются),
+`pos.payment`, `pos.shift`, `pos.cash_register`, `pos.cashier`,
+`wms.stock` (текущие остатки и способы оплаты в ДЗ-2 не требуются).
+
+## 10. Ключи, lineage и время версий
+
+- **Сопоставление ключей.** Интеграция по BK ДЗ-1 без суррогатных ключей:
+  товар в чеке, закупке и движении связывается по `sku`, партия — по
+  `batch_bk`, клиент CRM ↔ чек POS — по `customer_bk`, аптека — по
+  `pharmacy_bk`. Ключи Kafka (например, суррогатный `id` версии) используются
+  только как координаты события, бизнес-склейка идёт по BK из payload.
+- **Lineage.** На каждой строке dim/fact: `_load_batch_id` — порция,
+  впервые записавшая строку, и `_src_topic`, `_src_partition`,
+  `_src_offset` — основной источник. Для составных фактов основной
+  источник — событие строки (`receipt_line`, `purchase_line`, `movement`),
+  атрибуты заголовка помечены в таблице выше.
+- **Время версий.** `valid_from`/`valid_to` берутся из источников, где
+  история существовала (`sku_version.valid_from`, `price_version.
+  valid_from/valid_to`); `valid_to` версии SKU выводится как `valid_from`
+  следующей версии. Атрибуты только с текущим срезом (`city/region`
+  профиля, consent-признак) историзируются с первого снимка: `op='r'`
+  открывает версию с датой снимка; изменение атрибута без версий в
+  источнике закрывает версию моментом события.
+- **Обработка идемпотентности** — [ADR 011](adr/011-history-replay-idempotency.md).

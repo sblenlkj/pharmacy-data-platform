@@ -1,0 +1,78 @@
+# Тесты ключей и связей DDS (бонус dbt: «тесты ключей, связей и истории»).
+# Составные ключи (факты, dim_sku_version, dim_price) проверяются
+# сингулярными тестами dwh/tests/ — dbt unique не умеет кортежи.
+version: 2
+
+models:
+  - name: dim_sku
+    columns:
+      - name: sku
+        tests: [unique, not_null]
+  - name: dim_customer
+    columns:
+      - name: customer_bk
+        tests: [unique, not_null]
+  - name: dim_pharmacy
+    columns:
+      - name: pharmacy_bk
+        tests: [unique, not_null]
+  - name: dim_batch
+    columns:
+      - name: batch_bk
+        tests: [unique, not_null]
+      - name: sku
+        tests:
+          - not_null
+          - relationships:
+              to: ref('dim_sku')
+              field: sku
+  - name: dim_supplier
+    columns:
+      - name: supplier_bk
+        tests: [unique, not_null]
+  - name: dim_distribution_center
+    columns:
+      - name: dc_bk
+        tests: [unique, not_null]
+
+  - name: fact_sale_line
+    columns:
+      - name: sku
+        tests:
+          - relationships:
+              to: ref('dim_sku')
+              field: sku
+      - name: batch_bk
+        tests:
+          - relationships:
+              to: ref('dim_batch')
+              field: batch_bk
+      - name: pharmacy_bk
+        tests:
+          - relationships:
+              to: ref('dim_pharmacy')
+              field: pharmacy_bk
+  - name: fact_purchase_line
+    columns:
+      - name: sku
+        tests:
+          - relationships:
+              to: ref('dim_sku')
+              field: sku
+      - name: supplier_bk
+        tests:
+          - relationships:
+              to: ref('dim_supplier')
+              field: supplier_bk
+      - name: dc_bk
+        tests:
+          - relationships:
+              to: ref('dim_distribution_center')
+              field: dc_bk
+  - name: fact_movement
+    columns:
+      - name: sku
+        tests:
+          - relationships:
+              to: ref('dim_sku')
+              field: sku

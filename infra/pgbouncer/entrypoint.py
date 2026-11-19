@@ -51,7 +51,10 @@ server_login_retry = 1
 server_idle_timeout = 60
 server_lifetime = 600
 query_wait_timeout = 120
-ignore_startup_parameters = extra_float_digits
+# options: HW2-чекер передаёт statement_timeout/timezone startup-параметром
+# (psycopg2 options=...); в session-режиме pooler их не форвардит — игнорируем,
+# как extra_float_digits. Сессионные SET проходят независимо (HW1-чекер).
+ignore_startup_parameters = extra_float_digits,options
 stats_users = checker
 log_connections = 1
 log_disconnections = 1

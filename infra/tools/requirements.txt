@@ -1,3 +1,8 @@
 # Same versions as the team's uv.lock; the package is imported from /workspace/src.
+# ДЗ-2: dbt-trino runs in-process (scripts/load_dds, checker commands.load),
+# confluent-kafka — водяные знаки в scripts/infra/wait_raw_caught_up.py и сценарная
+# фаза чекера (KafkaProbe). Версия confluent-kafka — как в образе cdc-ingest.
 psycopg2-binary==2.9.13
 PyYAML==6.0.3
+dbt-trino==1.12.0
+confluent-kafka==2.16.1

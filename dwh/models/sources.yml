@@ -1,0 +1,31 @@
+version: 2
+
+# Инфраструктурные таблицы вне владения dbt: raw.cdc_events пишет ingest-сервис
+# raw.cdc_events пишет ingest-сервис (infra/ingest); ctl.* — scripts/load_dds. DDL — dwh/ddl/00_raw_ctl.sql.
+sources:
+  - name: raw
+    description: Слой сырых CDC-событий (append-only, at-least-once).
+    database: iceberg
+    schema: raw
+    tables:
+      - name: cdc_events
+        description: >
+          Одна строка — одно Kafka-сообщение Debezium; координаты
+          (topic, partition_id, kafka_offset) уникальны логически,
+          физические дубли снимает stg_cdc_events / v_cdc_events.
+
+  - name: ctl
+    description: Служебные таблицы пакетного загрузчика.
+    database: iceberg
+    schema: ctl
+    tables:
+      - name: load_batches
+        description: Журнал порций (batch_id, offsets_json, status).
+      - name: kafka_positions
+        description: Позиция обработки (topic, partition_id, next_offset).
+      - name: receipt_pharmacy
+        description: >
+          Справочник receipt_bk → pharmacy_bk (обогащение заголовка чека):
+          маршрут receipt → shift → cash_register → pharmacy исключён из
+          репликации (dwh_mapping.md §9), значения синхронизирует
+          scripts/load_dds из pos.contract.v_receipt.

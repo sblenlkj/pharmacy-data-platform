@@ -1,0 +1,40 @@
+%% Технический слой ДЗ-2: путь события от Kafka до контракта.
+%% Схемы каталога iceberg; staging и dim/fact — модели dbt (dwh/), raw/ctl —
+%% DDL dwh/ddl/00_raw_ctl.sql (владельцы: ingest-сервис и scripts/load_dds).
+%% Контракт представлений — hws_descriptions/hw2/hw02_contract.yaml.
+flowchart LR
+    subgraph K["Kafka (Debezium, at-least-once)"]
+        topics["4 сервиса × топики<br/>crm/catalog/pos/wms.public.*"]
+    end
+
+    subgraph RAW["схема raw"]
+        cdc["raw.cdc_events<br/>append-only журнал доставки<br/>партиция day(ingested_at)<br/>координаты topic+partition+offset"]
+    end
+
+    subgraph STG["схема dwh_detailed — staging (dbt, view)"]
+        dedup["stg_cdc_events<br/>дедуп row_number по<br/>(topic, partition_id, kafka_offset)"]
+        wrap["stg_* — 23 обёртки маршрутов<br/>разбор payload (before/after)<br/>последний выигрывает по координатам Kafka"]
+    end
+
+    subgraph DDS["схема dwh_detailed — dim/fact (dbt, table)"]
+        dims["8 dim + 3 fact<br/>факты: партиции month(...)<br/>lineage: _load_batch_id, _src_topic/partition/offset"]
+    end
+
+    subgraph CTX["схема ctl (загрузчик порций)"]
+        batches["ctl.load_batches<br/>batch_id, offsets_json, status"]
+        positions["ctl.kafka_positions<br/>topic, partition_id, next_offset"]
+    end
+
+    subgraph CONTRACT["схема contract_dwh (dbt, view)"]
+        vbusiness["v_sale_line, v_purchase_line, v_movement,<br/>v_sku(+history), v_customer, v_price_history,<br/>v_pharmacy, v_batch, v_supplier, v_distribution_center"]
+        vtech["v_cdc_events — дедуп-журнал<br/>v_load_batches — журнал порций"]
+    end
+
+    topics -->|"ingest"| cdc
+    cdc --> dedup
+    dedup --> wrap
+    wrap -->|"обогащение заголовков,<br/>batch→sku и т.п. (dwh_mapping §9)"| dims
+    dims --> vbusiness
+    dedup --> vtech
+    batches --> vtech
+    positions -.->|"диапазоны порции,<br/>продвижение после успеха"| wrap

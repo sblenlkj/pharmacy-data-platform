@@ -1,0 +1,37 @@
+# dbt-проект DWH ДЗ-2: staging над raw.cdc_events → dim/fact (dwh_detailed)
+# → представления контракта (contract_dwh). Модель — ADR-009, маршруты —
+# docs/dwh_mapping.md §9–10, механика порций — dwh/README.md.
+name: dwh
+version: '1.0'
+config-version: 2
+profile: dwh
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+clean-targets: ["target", "dbt_packages"]
+
+# Идентификатор порции, впервые записавшей строку (_load_batch_id).
+# «manual» — ручной dbt run без порции; рабочие запуски идут через
+# scripts/load_dds: --vars '{"load_batch_id": "...", "batch_ranges": [...]}',
+vars:
+  load_batch_id: manual
+
+models:
+  dwh:
+    staging:
+      # Обёртки над raw.cdc_events: дедуп доставки + разбор payload.
+      # Окно порции — макрос batch_filter; справочники-спутники
+      # (справочники/версии профилей/согласия) идут без окна (filtered=false).
+      +materialized: view
+    dds:
+      # Партиционирование фактов: факты month(<время факта>),
+      # dims — без партиций (свойство partitioning задаётся в config моделей
+      # фактов; dbt-trino 1.12 не знает partition_by). Стратегия инкремента —
+      # merge по естественным ключам (Trino MERGE INTO, Iceberg).
+      +materialized: incremental
+      +incremental_strategy: merge
+      +merge_exclude_columns: ['_load_batch_id']
+    contract:
+      # 13 представлений контракта, колонки/типы — hws_descriptions/hw2/hw02_contract.yaml.
+      +materialized: view
+      +schema: contract_dwh

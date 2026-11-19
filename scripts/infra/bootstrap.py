@@ -2,8 +2,14 @@
 
 Only the db-init service invokes this helper. Domain SQL remains team-owned.
 Run again after adding a migration: docker compose run --rm -T db-init
+
+HW2 additions: the `debezium` replication role, per-service CDC
+publications over the tables from docs/dwh_mapping.md §9 (single source of
+truth: scripts/infra/cdc_sources.json) and the automatic base seed that runs
+when the sources are still empty.
 """
 from hashlib import sha256
+import json
 import os
 from pathlib import Path
 import re
@@ -15,6 +21,7 @@ import yaml
 from common import SERVICES, connect, wait_for_leader
 
 ROOT = Path(__file__).resolve().parents[2]
+CDC_SOURCES = json.loads((ROOT / "scripts/infra/cdc_sources.json").read_text())
 
 
 def create_roles_and_databases(conn):
@@ -28,11 +35,21 @@ def create_roles_and_databases(conn):
                         (os.environ.get(key, role),))
         # Needed for pg_stat_wal_receiver.status on replicas; no application writes.
         cur.execute("GRANT pg_monitor TO checker")
+        # CDC consumer (Debezium Connect) reads the leader through haproxy:5000.
+        cur.execute("SELECT 1 FROM pg_roles WHERE rolname = 'debezium'")
+        if cur.fetchone() is None:
+            cur.execute(sql.SQL("CREATE ROLE {} LOGIN REPLICATION PASSWORD %s")
+                        .format(sql.Identifier("debezium")), (os.environ.get("DEBEZIUM_PASSWORD", "debezium"),))
+        else:
+            cur.execute(sql.SQL("ALTER ROLE {} WITH LOGIN REPLICATION PASSWORD %s")
+                        .format(sql.Identifier("debezium")), (os.environ.get("DEBEZIUM_PASSWORD", "debezium"),))
         for service in SERVICES:
             database = f"{service}_service_db"
             cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", (database,))
             if cur.fetchone() is None:
                 cur.execute(sql.SQL("CREATE DATABASE {} OWNER postgres").format(sql.Identifier(database)))
+            cur.execute(sql.SQL("GRANT CONNECT ON DATABASE {} TO debezium")
+                        .format(sql.Identifier(database)))
 
 
 def migration_body(text):
@@ -131,10 +148,80 @@ def configure_access_and_cdc(conn, service):
                     mode = sql.SQL("DEFAULT" if has_pk else "FULL")
                     cur.execute(sql.SQL("ALTER TABLE {}.{} REPLICA IDENTITY {}").format(
                         sql.Identifier(schema), sql.Identifier(table), mode))
+            configure_debezium_publication(conn, service)
             # Fail before reporting success if a required view is absent.
             contract = yaml.safe_load((ROOT / "hws_descriptions/hw1/hw01_contract.yaml").read_text())
             for view in contract["services"][service]["views"]:
                 cur.execute(sql.SQL("SELECT * FROM contract.{} LIMIT 0").format(sql.Identifier(view)))
+
+
+def configure_debezium_publication(conn, service):
+    """Dedicated publication + SELECT grants for the CDC tables (§9).
+
+    Runs inside the caller's transaction (configure_access_and_cdc).
+    """
+    tables = [sql.Identifier("public", t) for t in CDC_SOURCES[service]]
+    publication = f"pub_cdc_{service}"
+    with conn.cursor() as cur:
+        cur.execute(sql.SQL("GRANT USAGE ON SCHEMA public TO debezium"))
+        cur.execute(sql.SQL("GRANT SELECT ON {} TO debezium").format(
+            sql.SQL(", ").join(tables)))
+        # без blanket-DEFAULT PRIVILEGES: гранты и публикация сходятся к
+        # cdc_sources.json на каждом up — будущая non-CDC таблица не должна
+        # становиться автоматически читаемой репликационной ролью
+        # CREATE PUBLICATION has no IF NOT EXISTS — check pg_publication, then
+        # converge the table set (covers a changed cdc_sources.json on re-up).
+        cur.execute("SELECT 1 FROM pg_publication WHERE pubname = %s", (publication,))
+        if cur.fetchone() is None:
+            cur.execute(sql.SQL("CREATE PUBLICATION {} FOR TABLE {}").format(
+                sql.Identifier(publication),
+                sql.SQL(", ").join(tables)))
+        cur.execute(sql.SQL("ALTER PUBLICATION {} SET TABLE {}").format(
+            sql.Identifier(publication),
+            sql.SQL(", ").join(tables)))
+
+
+def source_row_counts(conn, service):
+    """Минимум по всем CDC-таблицам сервиса: гейт «засеяно» честен только
+    если нет ни одной пустой таблицы (первая-таблица-прокси пропускала бы
+    частично засеянную БД)."""
+    counts = []
+    with conn.cursor() as cur:
+        for table in CDC_SOURCES[service]:
+            cur.execute(sql.SQL("SELECT count(*) FROM {}").format(
+                sql.Identifier("public", table)))
+            counts.append(cur.fetchone()[0])
+    return min(counts)
+
+
+def seed_if_empty():
+    """Run the base generator when any source DB is still empty.
+
+    The generator inserts with ON CONFLICT DO NOTHING, so a rerun after a
+    partially completed seed only fills the gaps (idempotent on re-up).
+    """
+    counts = {}
+    for service in SERVICES:
+        conn = connect(f"{service}_service_db")
+        try:
+            counts[service] = source_row_counts(conn, service)
+        finally:
+            conn.close()
+    print("source row counts: " + ", ".join(f"{s}={c}" for s, c in counts.items()), flush=True)
+    if all(c > 0 for c in counts.values()):
+        print("sources already seeded; skipping data generation", flush=True)
+        return
+    from pharmacy_dwh.seed.config import DEFAULT_AS_OF, Settings
+    from pharmacy_dwh.seed.generator import Generator
+    seed = int(os.environ.get("DATA_SEED", "42"))
+    settings = Settings(seed=seed, delta=False, as_of=DEFAULT_AS_OF,
+                        host="haproxy", port=5000, user="postgres",
+                        password=os.environ.get("POSTGRES_PASSWORD", "postgres"))
+    print(f"seeding sources: seed={seed} via {settings.host}:{settings.port}", flush=True)
+    counts = Generator(settings).run()
+    for name, count in sorted(counts.items()):
+        print(f"  {name}: {count}", flush=True)
+    print("seed complete", flush=True)
 
 
 def main():
@@ -156,7 +243,8 @@ def main():
             print(f"ready {service}: schema, grants, publication", flush=True)
         finally:
             conn.close()
-    print("db-init completed; data generation is a separate command", flush=True)
+    seed_if_empty()
+    print("db-init completed: migrations, cdc role, publications, seed", flush=True)
 
 
 if __name__ == "__main__":

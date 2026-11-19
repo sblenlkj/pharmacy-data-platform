@@ -1,0 +1,334 @@
+#!/usr/bin/env python3
+"""Тестовые данные для сценария чекера ДЗ-2 (контракт commands.fixture).
+
+Интерфейс — hws_descriptions/hw2/checker_protocol.md, «Интерфейс команды
+записи тестовых данных»: JSON шага на stdin, ровно один JSON-ответ в
+stdout, журнал в stderr, код 0 после коммитов. Команда пишет только в
+PostgreSQL учебного стенда (через pgbouncer-rw, роль app) и только через
+штатные таблицы источников: переходы версий закрывают триггеры
+migrations/catalog/005 и migrations/crm/005, обезличивание контактов при
+soft delete — триггер migrations/crm/002 (семантика ADR-007; формат
+бизнес-ключей — ADR-008, как в генераторе ДЗ-1 src/pharmacy_dwh/seed).
+
+Шаги:
+  delta   {"batch_id": ...} — связанная цепочка в 4 БД: клиент
+          (+customer_profile_version), SKU (+sku_version +открытая
+          price_version), чек (+receipt_line со snapshot-полями, оплата —
+          вне репликации), закупка (purchase_order+purchase_line+batch) и
+          движение партии (movement типа receipt: существующий supplier →
+          существующий dc). Зависимые справочники (manufacturer,
+          sku_category, price_scope, loyalty_level, shift/cash_register/
+          cashier, supplier, dc) переиспользуются без новых событий.
+          Ответ: {"keys": {customer_bk, sku, receipt_bk, purchase_bk,
+          movement_bk}, "events": [все CDC-события шага]}; key события —
+          ключ Kafka = PK физической таблицы (суррогатные id
+          sku_version/price_version/customer_profile_version — через
+          RETURNING), op ∈ c/u/d, tombstone не приходит (физических
+          DELETE нет).
+  history {"batch_id", "keys", "sku_name"} — новая версия SKU с переданным
+          именем и новая отличающаяся цена в той же области действия;
+          valid_from обеих новых версий = времени изменения, старые
+          закрывают триггеры. Существующий чек не меняется.
+          Достаточно {"events": [...]}.
+  privacy {"batch_id", "keys"} — soft delete клиента шага delta:
+          UPDATE customer.deleted_at (контакты обезличит триггер).
+          Достаточно {"events": [...]}.
+
+Namespace бизнес-ключей — sanitized batch_id: повтор шага с тем же
+batch_id упрётся в PK (честный отказ, код 2), разные batch_id не
+конфликтуют и не пересекаются с данными генератора ДЗ-1.
+
+Окружение (tools-контейнер compose): PGHOST=pgbouncer-rw, PGPORT=6432,
+PGUSER=app, PGPASSWORD=app; каталоги БД — <svc>_service_db.
+"""
+import json
+import re
+import sys
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, ROUND_HALF_UP
+
+import psycopg2
+
+UTC = timezone.utc
+CENT = Decimal("0.01")
+
+REGISTERED_AT = datetime(2026, 6, 1, 0, 0, tzinfo=UTC)      # регистрация клиента
+VERSION_FROM = datetime(2026, 6, 1, 0, 0, tzinfo=UTC)       # версия SKU / открытая цена
+BATCH_RECEIVED = datetime(2026, 9, 10, 6, 0, tzinfo=UTC)    # приход партии
+ORDERED_AT = datetime(2026, 9, 5, 12, 0, tzinfo=UTC)        # заказ поставщику
+BATCH_MANUFACTURED = datetime(2026, 3, 1, tzinfo=UTC).date()
+BATCH_EXPIRY = datetime(2027, 6, 1, tzinfo=UTC).date()
+CHAIN_PRICE = Decimal("777.77")
+UNIT_COST = Decimal("432.10")
+PURCHASE_QTY = Decimal("100")
+
+
+def log(message):
+    print(f"check_fixture: {message}", file=sys.stderr, flush=True)
+
+
+def connect(service):
+    """Подключение к БД сервиса через пул (env tools-контейнера)."""
+    return psycopg2.connect(dbname=f"{service}_service_db", connect_timeout=10)
+
+
+def namespace(batch_id):
+    sanitized = re.sub(r"[^0-9A-Za-z]", "", batch_id).upper()
+    if not sanitized:
+        raise ValueError(f"batch_id {batch_id!r} не содержит алфанумерик")
+    return sanitized[:40]
+
+
+def money(value):
+    return value.quantize(CENT, rounding=ROUND_HALF_UP)
+
+
+def one(cursor):
+    row = cursor.fetchone()
+    if row is None:
+        raise ValueError("ожидалась одна строка, получено 0 (справочник пуст?)")
+    return row
+
+
+def event(topic, key, op):
+    return {"topic": topic, "key": key, "op": op}
+
+
+def run_delta(batch_id):
+    ns = namespace(batch_id)
+    customer_bk = f"CUSTOMER-{ns}-000001"
+    sku = f"SKU-{ns}-000001"
+    batch_bk = f"BATCH-{ns}-000001"
+    receipt_bk = f"RCPT-{ns}-000001"
+    purchase_bk = f"PO-{ns}-000001"
+    movement_bk = f"MOV-{ns}-000001"
+    sku_name = f"Fixture product {ns} 00001"
+    keys = {"customer_bk": customer_bk, "sku": sku, "receipt_bk": receipt_bk,
+            "purchase_bk": purchase_bk, "movement_bk": movement_bk}
+    events = []
+
+    # --- CRM: клиент + версия профиля (+контакт вне репликации) ---
+    with connect("crm") as conn, conn.cursor() as cur:
+        cur.execute("SELECT id FROM loyalty_level WHERE level_name = 'basic'")
+        level_id = one(cur)[0]
+        cur.execute("SELECT id FROM contact_type WHERE type_name = 'email'")
+        contact_type_id = one(cur)[0]
+        cur.execute(
+            "INSERT INTO customer (customer_bk, birth_year, sex, registered_at)"
+            " VALUES (%s, 1990, 'F', %s)", (customer_bk, REGISTERED_AT))
+        cur.execute(
+            "INSERT INTO customer_profile_version"
+            " (customer_bk, city, region, loyalty_level_id, valid_from, is_current)"
+            " VALUES (%s, 'Moscow', 'Moscow', %s, %s, true) RETURNING id",
+            (customer_bk, level_id, REGISTERED_AT))
+        profile_id = one(cur)[0]
+        cur.execute(
+            "INSERT INTO customer_contact"
+            " (contact_bk, customer_bk, contact_type_id, contact_value)"
+            " VALUES (%s, %s, %s, %s)",
+            (f"CONTACT-{ns}-000001-E", customer_bk, contact_type_id,
+             f"customer.{ns.lower()}@example.test"))
+    events.append(event("crm.public.customer", {"customer_bk": customer_bk}, "c"))
+    events.append(event("crm.public.customer_profile_version", {"id": profile_id}, "c"))
+
+    # --- каталог: SKU + версия + открытая цена (справочники переиспользуем) ---
+    with connect("catalog") as conn, conn.cursor() as cur:
+        cur.execute("SELECT manufacturer_bk FROM manufacturer ORDER BY manufacturer_bk LIMIT 1")
+        manufacturer_bk = one(cur)[0]
+        cur.execute("SELECT drug_form_bk FROM drug_form ORDER BY drug_form_bk LIMIT 1")
+        drug_form_bk = one(cur)[0]
+        cur.execute("SELECT id FROM sku_category WHERE category_name = 'otc'")
+        category_id = one(cur)[0]
+        cur.execute("SELECT id FROM price_scope WHERE scope_name = 'chain'")
+        scope_id = one(cur)[0]
+        cur.execute(
+            "INSERT INTO sku"
+            " (sku_bk, manufacturer_bk, drug_form_bk, pack_qty, is_vital, is_active)"
+            " VALUES (%s, %s, %s, 10, false, true)",
+            (sku, manufacturer_bk, drug_form_bk))
+        cur.execute(
+            "INSERT INTO sku_version"
+            " (sku_bk, sku_name, category_id, is_rx, valid_from, is_current)"
+            " VALUES (%s, %s, %s, false, %s, true) RETURNING id",
+            (sku, sku_name, category_id, VERSION_FROM))
+        sku_version_id = one(cur)[0]
+        cur.execute(
+            "INSERT INTO price_version"
+            " (sku_bk, price_scope_id, scope_bk, price, currency, valid_from, is_current)"
+            " VALUES (%s, %s, 'ALL', %s, 'RUB', %s, true) RETURNING id",
+            (sku, scope_id, CHAIN_PRICE, VERSION_FROM))
+        price_version_id = one(cur)[0]
+    events.append(event("catalog.public.sku", {"sku_bk": sku}, "c"))
+    events.append(event("catalog.public.sku_version", {"id": sku_version_id}, "c"))
+    events.append(event("catalog.public.price_version", {"id": price_version_id}, "c"))
+
+    # --- POS: чек + строка (+оплата вне репликации; смена/кассир/аптека существуют) ---
+    with connect("pos") as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT s.shift_bk, s.opened_at, s.closed_at, c.cashier_bk"
+            "  FROM shift s"
+            "  JOIN cash_register cr ON cr.register_bk = s.register_bk"
+            "  JOIN pharmacy p ON p.pharmacy_bk = cr.pharmacy_bk"
+            "  JOIN (SELECT cashier_bk FROM cashier ORDER BY cashier_bk LIMIT 1) c ON true"
+            " WHERE p.is_active AND p.deleted_at IS NULL"
+            " ORDER BY s.shift_bk LIMIT 1")
+        shift_bk, opened_at, closed_at, cashier_bk = one(cur)
+        now = datetime.now(UTC)
+        receipt_dt = max(now, opened_at + timedelta(seconds=1))
+        if closed_at is not None:
+            receipt_dt = min(receipt_dt, closed_at - timedelta(seconds=1))
+        total = money(Decimal(2) * CHAIN_PRICE)
+        cur.execute(
+            "INSERT INTO receipt"
+            " (receipt_bk, shift_bk, cashier_bk, customer_bk, receipt_dt, doc_type,"
+            "  total_amount, currency)"
+            " VALUES (%s, %s, %s, %s, %s, 'sale', %s, 'RUB')",
+            (receipt_bk, shift_bk, cashier_bk, customer_bk, receipt_dt, total))
+        cur.execute(
+            "INSERT INTO receipt_line"
+            " (receipt_bk, line_no, sku, batch_bk, quantity, unit_price, line_discount,"
+            "  is_rx_snapshot, sku_name_snapshot, batch_expiry_date_snapshot)"
+            " VALUES (%s, 1, %s, %s, 2, %s, 0, false, %s, %s)",
+            (receipt_bk, sku, batch_bk, CHAIN_PRICE, sku_name, BATCH_EXPIRY))
+        cur.execute(
+            "INSERT INTO payment (receipt_bk, payment_no, payment_method, amount, currency)"
+            " VALUES (%s, 1, 'cash', %s, 'RUB')", (receipt_bk, total))
+    events.append(event("pos.public.receipt", {"receipt_bk": receipt_bk}, "c"))
+    events.append(event("pos.public.receipt_line", {"receipt_bk": receipt_bk, "line_no": 1}, "c"))
+
+    # --- WMS: партия + закупка + движение (supplier/dc существуют) ---
+    with connect("wms") as conn, conn.cursor() as cur:
+        cur.execute("SELECT supplier_bk FROM supplier WHERE is_active AND deleted_at IS NULL"
+                    " ORDER BY supplier_bk LIMIT 1")
+        supplier_bk = one(cur)[0]
+        cur.execute("SELECT dc_bk FROM distribution_center WHERE is_active AND deleted_at IS NULL"
+                    " ORDER BY dc_bk LIMIT 1")
+        dc_bk = one(cur)[0]
+        cur.execute(
+            "INSERT INTO batch"
+            " (batch_bk, sku, series_no, manufactured_date, expiry_date, received_at)"
+            " VALUES (%s, %s, %s, %s, %s, %s)",
+            (batch_bk, sku, f"SERIES-{ns}-000001", BATCH_MANUFACTURED, BATCH_EXPIRY,
+             BATCH_RECEIVED))
+        cur.execute(
+            "INSERT INTO purchase_order (purchase_bk, supplier_bk, dc_bk, ordered_at)"
+            " VALUES (%s, %s, %s, %s)", (purchase_bk, supplier_bk, dc_bk, ORDERED_AT))
+        cur.execute(
+            "INSERT INTO purchase_line"
+            " (purchase_bk, line_no, sku, batch_bk, quantity, unit_cost, currency)"
+            " VALUES (%s, 1, %s, %s, %s, %s, 'RUB')",
+            (purchase_bk, sku, batch_bk, PURCHASE_QTY, UNIT_COST))
+        cur.execute(
+            "INSERT INTO movement"
+            " (movement_bk, batch_bk, movement_type, src_type, src_bk, dst_type, dst_bk,"
+            "  qty, dispatched_at, moved_at)"
+            " VALUES (%s, %s, 'receipt', 'supplier', %s, 'dc', %s, %s, %s, %s)",
+            (movement_bk, batch_bk, supplier_bk, dc_bk, PURCHASE_QTY,
+             BATCH_RECEIVED - timedelta(hours=18), BATCH_RECEIVED))
+    events.append(event("wms.public.batch", {"batch_bk": batch_bk}, "c"))
+    events.append(event("wms.public.purchase_order", {"purchase_bk": purchase_bk}, "c"))
+    events.append(event("wms.public.purchase_line", {"purchase_bk": purchase_bk, "line_no": 1}, "c"))
+    events.append(event("wms.public.movement", {"movement_bk": movement_bk}, "c"))
+
+    log(f"delta {batch_id}: customer={customer_bk} sku={sku} receipt={receipt_bk} "
+        f"purchase={purchase_bk} movement={movement_bk}; событий: {len(events)}")
+    return {"keys": keys, "events": events}
+
+
+def run_history(batch_id, keys, sku_name):
+    sku = keys["sku"]
+    changed_at = datetime.now(UTC)
+    events = []
+    with connect("catalog") as conn, conn.cursor() as cur:
+        # Текущая версия SKU: новую вставляем, старую закроет триггер 005.
+        cur.execute(
+            "SELECT id, category_id, is_rx FROM sku_version"
+            " WHERE sku_bk = %s AND is_current FOR UPDATE", (sku,))
+        old_version_id, category_id, is_rx = one(cur)
+        cur.execute(
+            "INSERT INTO sku_version"
+            " (sku_bk, sku_name, category_id, is_rx, valid_from, is_current)"
+            " VALUES (%s, %s, %s, %s, %s, true) RETURNING id",
+            (sku, sku_name, category_id, is_rx, changed_at))
+        new_version_id = one(cur)[0]
+        # Действующая цена (у тестового SKU одна; выбираем детерминированно):
+        # вставляем отличающуюся в той же области, старую закроет триггер 005.
+        cur.execute(
+            "SELECT id, price_scope_id, scope_bk, price, currency FROM price_version"
+            " WHERE sku_bk = %s AND is_current"
+            " ORDER BY price_scope_id, scope_bk, valid_from LIMIT 1 FOR UPDATE", (sku,))
+        old_price_id, scope_id, scope_bk, price, currency = one(cur)
+        new_price = money(price * Decimal("1.10"))
+        if new_price == price:
+            new_price = money(price + CENT)
+        cur.execute(
+            "INSERT INTO price_version"
+            " (sku_bk, price_scope_id, scope_bk, price, currency, valid_from, is_current)"
+            " VALUES (%s, %s, %s, %s, %s, %s, true) RETURNING id",
+            (sku, scope_id, scope_bk, new_price, currency, changed_at))
+        new_price_id = one(cur)[0]
+    events.append(event("catalog.public.sku_version", {"id": old_version_id}, "u"))
+    events.append(event("catalog.public.sku_version", {"id": new_version_id}, "c"))
+    events.append(event("catalog.public.price_version", {"id": old_price_id}, "u"))
+    events.append(event("catalog.public.price_version", {"id": new_price_id}, "c"))
+    log(f"history {batch_id}: sku={sku} name={sku_name!r} changed_at={changed_at.isoformat()}; "
+        f"событий: {len(events)}")
+    return {"events": events}
+
+
+def run_privacy(batch_id, keys):
+    customer_bk = keys["customer_bk"]
+    deleted_at = datetime.now(UTC)
+    with connect("crm") as conn, conn.cursor() as cur:
+        # Soft delete как в ДЗ-1: контакты обезличит триггер
+        # anonymize_customer_contacts (migrations/crm/002).
+        cur.execute(
+            "UPDATE customer SET deleted_at = %s"
+            " WHERE customer_bk = %s AND deleted_at IS NULL", (deleted_at, customer_bk))
+        if cur.rowcount != 1:
+            raise ValueError(f"клиент {customer_bk} не найден или уже удалён")
+    events = [event("crm.public.customer", {"customer_bk": customer_bk}, "u")]
+    log(f"privacy {batch_id}: customer={customer_bk} deleted_at={deleted_at.isoformat()}; "
+        f"событий: {len(events)}")
+    return {"events": events}
+
+
+def main():
+    step = sys.argv[1] if len(sys.argv) > 1 else ""
+    try:
+        request = json.loads(sys.stdin.read())
+    except json.JSONDecodeError as exc:
+        log(f"некорректный JSON шага: {exc}")
+        return 2
+    batch_id = request.get("batch_id")
+    if not batch_id:
+        log("в JSON шага обязателен batch_id")
+        return 2
+    try:
+        if step == "delta":
+            result = run_delta(batch_id)
+        elif step == "history":
+            keys = request.get("keys") or {}
+            sku_name = request.get("sku_name")
+            if not keys.get("sku") or not sku_name:
+                log("history: в JSON шага нужны keys.sku и sku_name")
+                return 2
+            result = run_history(batch_id, keys, sku_name)
+        elif step == "privacy":
+            keys = request.get("keys") or {}
+            if not keys.get("customer_bk"):
+                log("privacy: в JSON шага нужен keys.customer_bk")
+                return 2
+            result = run_privacy(batch_id, keys)
+        else:
+            log(f"неизвестный шаг {step!r} (delta | history | privacy)")
+            return 2
+    except Exception as exc:  # noqa: BLE001 — любая ошибка записи: отказ без JSON
+        log(f"{step} {batch_id}: ошибка: {exc}")
+        return 2
+    sys.stdout.write(json.dumps(result, ensure_ascii=False) + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

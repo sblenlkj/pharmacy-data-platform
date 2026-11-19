@@ -1,0 +1,391 @@
+#!/usr/bin/env python3
+"""Пакетная загрузка DDS из raw (контракт команды commands.load ДЗ-2).
+
+Вызовы:
+  ./scripts/load_dds                          # новая порция, batch_id создаётся здесь (UUID)
+  ./scripts/load_dds --batch-id ID            # новая порция с переданным batch_id
+  ./scripts/load_dds --batch-id ID --replay   # повторно применить сохранённые диапазоны порции
+
+Механика — docs/adr/011-history-replay-idempotency.md:
+  1. Диапазоны [start_offset, end_offset) по topic/partition:
+     без --replay — от ctl.kafka_positions до текущих максимумов raw.cdc_events;
+     с --replay — из ctl.load_batches по batch_id (позиции не двигаются,
+     строка порции не перезаписывается).
+  2. Затронутые топики → затронутые staging-модели → dbt run --select
+     <модели>+ (in-process, dbtRunner): только затронутые ветки DAG,
+     обработка ограничена окном порции (vars batch_ranges; инкрементальные
+     merge-модели dds читают staging с фильтром окна — ADR-011). Первая
+     порция (нет успешных записей в ctl.load_batches) идёт с
+     --full-refresh: таблицы строятся с нуля по всему окну.
+  3. Успех → ctl.load_batches(batch_id, offsets_json, status=success) и
+     продвижение ctl.kafka_positions (кроме --replay); неудача — строка со
+     статусом failed, позиции стоят на месте, код возврата ≠ 0.
+
+Справочник ctl.receipt_pharmacy (обогащение pharmacy_bk чека — маршрут
+shift → cash_register → pharmacy вне репликации) пересинхронизируется из
+pos.contract.v_receipt, когда затронут топик pos.public.receipt или
+справочник пуст (в т.ч. replay первой порции).
+
+Окружение: TRINO_HOST/PORT/USER/CATALOG (стенд compose: trino/8080/admin/
+iceberg), PGHOST/PGPORT/PGUSER/PGPASSWORD (pgbouncer, роль app). dbt
+запускается in-process (dbt-trino в образе tools), target/log — в /tmp:
+репозиторий смонтирован read-only. Код возврата 0 — только после
+завершения загрузки (или честного «новых событий нет»).
+"""
+import argparse
+import json
+import os
+import sys
+import time
+import uuid
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+DWH_DIR = REPO / "dwh"
+DDL_PATH = DWH_DIR / "ddl" / "00_raw_ctl.sql"
+DBT_TARGET_PATH = "/tmp/dwh-dbt-target"
+DBT_LOG_PATH = "/tmp/dwh-dbt-logs"
+
+# Таблицы dwh_detailed для сводки «вставлено строк по таблицам» (журнал).
+DDS_TABLES = (
+    "dim_sku", "dim_sku_version", "dim_price", "dim_customer", "dim_pharmacy",
+    "dim_batch", "dim_supplier", "dim_distribution_center",
+    "fact_sale_line", "fact_purchase_line", "fact_movement",
+)
+
+TRINO = {
+    "host": os.environ.get("TRINO_HOST", "trino"),
+    "port": int(os.environ.get("TRINO_PORT", "8080")),
+    "user": os.environ.get("TRINO_USER", "admin"),
+    "catalog": os.environ.get("TRINO_CATALOG", "iceberg"),
+}
+
+
+def log(message):
+    print(f"load_dds: {message}", flush=True)
+
+
+def trino_connect(attempts=6, wait=5.0):
+    import trino.dbapi
+
+    last = None
+    for _ in range(attempts):
+        try:
+            conn = trino.dbapi.connect(
+                host=TRINO["host"], port=TRINO["port"], user=TRINO["user"],
+                catalog=TRINO["catalog"], timezone="UTC")
+            cur = conn.cursor()
+            cur.execute("SELECT 1")
+            cur.fetchall()
+            return conn
+        except Exception as exc:  # noqa: BLE001 — произвольный сбой клиента/координатора
+            last = exc
+            time.sleep(wait)
+    raise SystemExit(f"load_dds: trino недоступен ({TRINO['host']}): {last}")
+
+
+def query(conn, sql, params=None):
+    cur = conn.cursor()
+    cur.execute(sql, params)
+    names = [c[0].lower() for c in cur.description] if cur.description else []
+    return [dict(zip(names, row)) for row in cur.fetchall()]
+
+
+def execute(conn, sql, params=None):
+    cur = conn.cursor()
+    cur.execute(sql, params)
+    cur.fetchall()
+
+
+def apply_ctl_ddl(conn):
+    """DDL инфраструктурного слоя (идемпотентен, IF NOT EXISTS) — единый
+    источник dwh/ddl/00_raw_ctl.sql; ingest применяет его раньше, но образ
+    ingest может быть старее последних таблиц ctl (receipt_pharmacy)."""
+    lines = [ln for ln in DDL_PATH.read_text(encoding="utf-8").splitlines()
+             if not ln.lstrip().startswith("--")]
+    statements = [s.strip() for s in "\n".join(lines).split(";") if s.strip()]
+    for stmt in statements:
+        execute(conn, stmt)
+    log(f"ctl DDL applied: {len(statements)} statements (idempotent)")
+
+
+def read_positions(conn):
+    rows = query(conn, f"SELECT topic, partition_id, next_offset FROM {TRINO['catalog']}.ctl.kafka_positions")
+    return {(r["topic"], r["partition_id"]): r["next_offset"] for r in rows}
+
+
+def read_raw_maxima(conn):
+    rows = query(
+        conn,
+        f"SELECT topic, partition_id, max(kafka_offset) + 1 AS end_offset "
+        f"FROM {TRINO['catalog']}.raw.cdc_events GROUP BY topic, partition_id")
+    return {(r["topic"], r["partition_id"]): r["end_offset"] for r in rows}
+
+
+def compute_ranges(conn):
+    """Диапазоны [saved_position, current_max) по каждому topic/partition."""
+    positions = read_positions(conn)
+    maxima = read_raw_maxima(conn)
+    ranges = []
+    for key in sorted(set(positions) | set(maxima)):
+        start = positions.get(key, 0)
+        end = maxima.get(key, 0)
+        ranges.append({
+            "topic": key[0], "partition": key[1],
+            "start_offset": start, "end_offset": end,
+        })
+    return ranges
+
+
+def read_batch(conn, batch_id):
+    rows = query(conn, f"SELECT offsets_json, status FROM {TRINO['catalog']}.ctl.load_batches "
+                       "WHERE batch_id = ?", (batch_id,))
+    return rows[0] if rows else None
+
+
+def has_successful_batch(conn):
+    rows = query(conn, f"SELECT count(*) AS n FROM {TRINO['catalog']}.ctl.load_batches "
+                       "WHERE status = 'success'")
+    return rows[0]["n"] > 0
+
+
+def batch_row_exists(conn, batch_id):
+    return read_batch(conn, batch_id) is not None
+
+
+def insert_batch_row(conn, batch_id, ranges, status):
+    execute(conn, f"INSERT INTO {TRINO['catalog']}.ctl.load_batches VALUES (?, ?, ?)",
+            (batch_id, offsets_json(ranges), status))
+
+
+def offsets_json(ranges):
+    return json.dumps(ranges, ensure_ascii=False, separators=(",", ":"))
+
+
+def advance_positions(conn, ranges):
+    """Один атомарный MERGE вместо N пар DELETE+INSERT: нет окна сбоя между
+    ними и один снапшот ctl.kafka_positions на порцию."""
+    active = [r for r in ranges if r["end_offset"] > r["start_offset"]]
+    if not active:
+        return
+    values = ",".join(["(?, ?, ?)"] * len(active))
+    execute(conn,
+            f"MERGE INTO {TRINO['catalog']}.ctl.kafka_positions t "
+            f"USING (VALUES {values}) AS s(topic, partition_id, next_offset) "
+            "ON t.topic = s.topic AND t.partition_id = s.partition_id "
+            "WHEN MATCHED THEN UPDATE SET next_offset = s.next_offset "
+            "WHEN NOT MATCHED THEN INSERT VALUES (s.topic, s.partition_id, s.next_offset)",
+            [v for r in active for v in (r["topic"], r["partition"], r["end_offset"])])
+
+
+def sync_receipt_pharmacy(conn, force=False):
+    """Полная пересинхронизация ctl.receipt_pharmacy из pos.contract.v_receipt
+    (той же формулы receipt → shift → cash_register → pharmacy, что и эталон
+    чекера). Вызывается, когда затронут топик чеков или справочник пуст —
+    значения детерминированы, replay воспроизводит их без изменений."""
+    if not force:
+        rows = query(conn, f"SELECT count(*) AS n FROM {TRINO['catalog']}.ctl.receipt_pharmacy")
+        if rows[0]["n"] > 0:
+            return False
+    import psycopg2
+
+    # pgbouncer (transaction pooling) не принимает startup-параметр options —
+    # statement_timeout не задаём, выборка маленькая (~20k строк)
+    pg = psycopg2.connect(dbname="pos_service_db", connect_timeout=10)
+    try:
+        with pg.cursor() as cur:
+            cur.execute("SELECT receipt_bk, pharmacy_bk FROM contract.v_receipt")
+            mapping = cur.fetchall()
+    finally:
+        pg.close()
+    execute(conn, f"DELETE FROM {TRINO['catalog']}.ctl.receipt_pharmacy")
+    chunk = 5000
+    for i in range(0, len(mapping), chunk):
+        part = mapping[i:i + chunk]
+        execute(conn, f"INSERT INTO {TRINO['catalog']}.ctl.receipt_pharmacy VALUES "
+                      + ",".join(["(?, ?)"] * len(part)),
+                [value for row in part for value in row])
+    log(f"ctl.receipt_pharmacy synced: {len(mapping)} receipts")
+    return True
+
+
+def staging_models(topics):
+    """Затронутые топики → staging-модели: 'crm.public.customer' → stg_crm_customer."""
+    models = set()
+    for topic in topics:
+        service, _, table = topic.split(".", 2)
+        models.add(f"stg_{service}_{table.split('.')[-1]}")
+    return sorted(models)
+
+
+def run_dbt(batch_id, ranges, models, full_refresh):
+    """dbt run in-process (dbt-trino в образе tools). Возвращает (ok, nodes):
+    nodes — [{name, status, message}] для сводки/журнала."""
+    from dbt.cli.main import dbtRunner
+
+    # stg_cdc_events — общее вью поверх raw.cdc_events, на него ссылаются все
+    # staging-модели; включаем в каждую порцию, чтобы прогон был самодостаточен
+    # и на пустом каталоге (иначе первый запуск на чистых томах падает
+    # TABLE_NOT_FOUND на stg_cdc_events).
+    selection = " ".join(["stg_cdc_events"] + [f"{m}+" for m in models]
+                         + ["v_load_batches", "v_cdc_events"])
+    args = [
+        "run",
+        "--project-dir", str(DWH_DIR),
+        "--profiles-dir", str(DWH_DIR),
+        "--target-path", DBT_TARGET_PATH,
+        "--log-path", DBT_LOG_PATH,
+        "--no-use-colors",
+        "--select", selection,
+        "--vars", json.dumps({
+            "load_batch_id": batch_id,
+            "batch_ranges": ranges,
+        }, ensure_ascii=False),
+    ]
+    if full_refresh:
+        args.append("--full-refresh")
+    log(f"dbt run --select '{selection}'{' --full-refresh' if full_refresh else ''} "
+        f"(batch_id={batch_id}, {len(ranges)} диапазонов)")
+    result = dbtRunner().invoke(args)
+    nodes = []
+    # dbt 1.12: dbtRunnerResult.result — результат задачи (RunResult),
+    # внутри .results — список поузловых исходов; при сбое парсинга поле
+    # может отсутствовать — тогда довольствуемся общим success.
+    task_result = getattr(result, "result", None)
+    for item in getattr(task_result, "results", None) or []:
+        nodes.append({
+            "name": item.node.name,
+            "status": str(item.status),
+            "message": (item.message or "").splitlines()[-1] if item.message else "",
+        })
+    return bool(result.success), nodes
+
+
+def inserted_by_batch(conn, batch_id):
+    """Строки, впервые записанные порцией (_load_batch_id при merge
+    не перезаписывается) — для журнала загрузки. Один UNION ALL вместо
+    11 последовательных count-сканов."""
+    union = " UNION ALL ".join(
+        f"SELECT '{table}' AS tbl, count(*) AS n "
+        f"FROM {TRINO['catalog']}.dwh_detailed.{table} WHERE _load_batch_id = ?"
+        for table in DDS_TABLES)
+    return {row["tbl"]: row["n"] for row in query(conn, union, [batch_id] * len(DDS_TABLES))}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--batch-id", help="идентификатор порции от чекера")
+    parser.add_argument("--replay", action="store_true",
+                        help="повторно применить сохранённые диапазоны порции")
+    args = parser.parse_args()
+    if args.replay and not args.batch_id:
+        parser.error("--replay требует --batch-id")
+
+    started = time.monotonic()
+    batch_id = args.batch_id or str(uuid.uuid4())
+    conn = trino_connect()
+    apply_ctl_ddl(conn)
+
+    if args.replay:
+        stored = read_batch(conn, batch_id)
+        if stored is None:
+            print(f"load_dds: порция {batch_id} не найдена в ctl.load_batches",
+                  file=sys.stderr)
+            return 2
+        ranges = [r for r in json.loads(stored["offsets_json"]) if r["end_offset"] > r["start_offset"]]
+        active_topics = {r["topic"] for r in ranges}
+        full_refresh = False
+        log(f"replay порции {batch_id} (status={stored['status']}, "
+            f"{len(ranges)} активных диапазонов); позиции не двигаются")
+    else:
+        ranges = compute_ranges(conn)
+        active = [r for r in ranges if r["end_offset"] > r["start_offset"]]
+        active_topics = {r["topic"] for r in active}
+        ranges = active
+        if not active:
+            log("новых событий нет (kafka_positions покрывают raw) — нечего грузить")
+            return 0
+        full_refresh = not has_successful_batch(conn)
+        events = sum(r["end_offset"] - r["start_offset"] for r in active)
+        log(f"порция {batch_id}: {len(active)} диапазонов, {events} событий, "
+            f"затронуто топиков: {len(active_topics)}"
+            + (", первая загрузка (--full-refresh)" if full_refresh else ""))
+
+    # Обогащение pharmacy_bk: чеки затронуты или справочник ещё пуст.
+    sync_receipt_pharmacy(conn, force="pos.public.receipt" in active_topics)
+
+    ok, nodes = run_dbt(batch_id, ranges, staging_models(active_topics), full_refresh)
+    if not ok:
+        failed = [n for n in nodes if n["status"] not in ("success", "skipped")]
+        for node in failed:
+            print(f"load_dds: dbt {node['name']}: {node['status']}: {node['message']}",
+                  file=sys.stderr)
+        if not batch_row_exists(conn, batch_id):
+            insert_batch_row(conn, batch_id, ranges, "failed")
+        log(f"порция {batch_id} FAILED ({len(failed)} моделей), "
+            f"позиции не продвинуты")
+        return 1
+
+    # Дрейф cdc_sources.json ↔ dbt-проект: `--select stg_x+` по несуществующей
+    # модели совпадает с 0 узлов и возвращает success — порция молча
+    # «загрузилась» бы без событий таблицы. Каждый активный топик обязан
+    # отобразиться на выполненный узел DAG.
+    expected_models = staging_models(active_topics)
+    missing = [m for m in expected_models
+               if m not in {n["name"] for n in nodes}]
+    if missing:
+        if not batch_row_exists(conn, batch_id):
+            insert_batch_row(conn, batch_id, ranges, "failed")
+        print(f"load_dds: порция {batch_id}: staging-модели не выполнены "
+              f"(нет в DAG?): {', '.join(missing)}", file=sys.stderr)
+        log("позиции не продвинуты")
+        return 1
+
+    # Журнал порции: одна строка на batch_id; replay строку
+    # не перезаписывает, позиции не двигает.
+    inserted = inserted_by_batch(conn, batch_id)
+    total_new = sum(inserted.values())
+    events_in_batch = sum(r["end_offset"] - r["start_offset"] for r in ranges)
+
+    # Защита от «успешного» пустого прогона: первая порция с непустым окном
+    # обязана записать строки (например, сломанный фильтр окна дал бы
+    # dbt-success на пустых таблицах — позиций двигать нельзя).
+    if full_refresh and events_in_batch > 0 and total_new == 0:
+        if not batch_row_exists(conn, batch_id):
+            insert_batch_row(conn, batch_id, ranges, "failed")
+        print("load_dds: первая порция записала 0 строк при непустом окне — "
+              "фильтр окна/диапазоны подозрительны; позиция не двигается",
+              file=sys.stderr)
+        return 1
+
+    if not batch_row_exists(conn, batch_id):
+        insert_batch_row(conn, batch_id, ranges, "success")
+    else:
+        # повторный запуск ранее упавшей порции с тем же batch_id завершился
+        # успешно — отмечаем это (строка порции остаётся одна); replay сюда
+        # не попадает: у него свой флаг ниже и статус не меняется при уже
+        # успешной порции
+        if not args.replay:
+            execute(conn, f"UPDATE {TRINO['catalog']}.ctl.load_batches "
+                          "SET status = 'success' WHERE batch_id = ? AND status <> 'success'",
+                    (batch_id,))
+    if not args.replay:
+        advance_positions(conn, ranges)
+        log(f"порция {batch_id} success: kafka_positions продвинуты; "
+            f"впервые записано строк: {total_new}")
+        for table, count in inserted.items():
+            if count:
+                print(f"load_dds:   {table}: {count}", flush=True)
+    else:
+        log(f"replay порции {batch_id} success: данные воспроизведены "
+            f"(строк с _load_batch_id={batch_id[:8]}…: {total_new}); "
+            f"позиции на месте")
+
+    elapsed = time.monotonic() - started
+    log(f"готово за {elapsed:.1f} с ({batch_id})")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -18,6 +18,18 @@ AGENTS.md
 # Private working notes — never commit (checklists, reviews, work logs)
 /hw01_checklist.md
 /review_*.md
+/notes/hw2/
+
+# dbt artifacts (dwh/)
+/dwh/target/
+/dwh/logs/
+/dwh/dbt.log
+/dwh/dbt_packages/
+/dwh/.user.yml
+
+# Heavy build inputs — fetched from Maven Central at image build
+# (sha256 pinned in infra/hive-metastore/Dockerfile)
+/infra/hive-metastore/*.jar
 
 # Local credentials and generated diagnostics
 .env
@@ -25,3 +37,5 @@ reports/*
 !reports/.gitkeep
 !reports/failover/
 !reports/failover/**
+# Итоговый JSON-отчёт чекера ДЗ-2 (сценарий включает статику) — артефакт защиты
+!reports/hw02-scenario-final.json

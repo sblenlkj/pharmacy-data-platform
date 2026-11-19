@@ -1,0 +1,25 @@
+# Подключение к Trino — через переменные окружения (запуск внутри сети
+# compose, образ tools: TRINO_HOST=trino и т.д.; host-порты из WSL
+# недоступны из WSL). target выбирает DBT_TARGET
+# (по умолчанию main — основной стенд ДЗ-2; spike1 — стенд спайка).
+dwh:
+  target: "{{ env_var('DBT_TARGET', 'main') }}"
+  outputs:
+    main:
+      type: trino
+      host: "{{ env_var('TRINO_HOST', 'trino') }}"
+      port: "{{ env_var('TRINO_PORT', '8080') | int }}"
+      user: "{{ env_var('TRINO_USER', 'admin') }}"
+      catalog: "{{ env_var('TRINO_CATALOG', 'iceberg') }}"
+      schema: dwh_detailed
+      threads: "{{ env_var('DBT_THREADS', '4') | int }}"
+      http_scheme: http
+    spike1:
+      type: trino
+      host: spike1-trino
+      port: 8080
+      user: admin
+      catalog: iceberg
+      schema: dwh_detailed
+      threads: 4
+      http_scheme: http

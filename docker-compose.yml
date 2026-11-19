@@ -58,10 +58,22 @@ x-tools: &tools
     APP_PASSWORD: ${APP_PASSWORD:-app}
     CHECKER_PASSWORD: ${CHECKER_PASSWORD:-checker}
     PATRONI_API_PASSWORD: ${PATRONI_API_PASSWORD:-patroni}
+    DATA_SEED: ${DATA_SEED:-42}
+    DEBEZIUM_PASSWORD: ${DEBEZIUM_PASSWORD:-debezium}
     PGHOST: pgbouncer-rw
     PGPORT: '6432'
     PGUSER: app
     PGPASSWORD: ${APP_PASSWORD:-app}
+    # Шаг 3 ДЗ-2: подключение Trino для scripts/load_dds (dbt, target main)
+    # и scripts/hw2/check_*.py; источники чекера HW02 (hw02_submission.container.yaml).
+    TRINO_HOST: trino
+    TRINO_PORT: '8080'
+    TRINO_USER: admin
+    TRINO_CATALOG: iceberg
+    HW02_CRM_DSN: postgresql://checker:${CHECKER_PASSWORD:-checker}@pgbouncer-rw:6432/crm_service_db
+    HW02_CATALOG_DSN: postgresql://checker:${CHECKER_PASSWORD:-checker}@pgbouncer-rw:6432/catalog_service_db
+    HW02_POS_DSN: postgresql://checker:${CHECKER_PASSWORD:-checker}@pgbouncer-rw:6432/pos_service_db
+    HW02_WMS_DSN: postgresql://checker:${CHECKER_PASSWORD:-checker}@pgbouncer-rw:6432/wms_service_db
     PYTHONPATH: /workspace/src
     PYTHONUNBUFFERED: '1'
     PYTHONDONTWRITEBYTECODE: '1'
@@ -205,6 +217,243 @@ services:
     <<: *tools
     profiles: [tools]
 
+  # ---- ДЗ-2: OLAP-стек (перенос стенда spike 1 без изменений конфигов) ----
+
+  minio:
+    image: bitnamilegacy/minio:2025.7.23-debian-12-r5
+    restart: unless-stopped
+    logging: *logging
+    networks: [backend]
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+      MINIO_DEFAULT_BUCKETS: lakehouse
+    ports: ['127.0.0.1:9000:9000', '127.0.0.1:9001:9001']
+    volumes:
+      # bitnami-образ хранит данные в /bitnami/minio/data, а не /data —
+      # монтирование в /data даёт анонимный том, теряемый при compose down.
+      - minio-data:/bitnami/minio/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  hive-metastore-db:
+    image: postgres:16.16-alpine3.23
+    restart: unless-stopped
+    logging: *logging
+    networks: [backend]
+    environment:
+      POSTGRES_USER: hive
+      POSTGRES_PASSWORD: hivepass
+      POSTGRES_DB: hive_metastore
+    volumes: [hms-db-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hive -d hive_metastore"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  hive-metastore:
+    image: pharmacy-hw1-hive-metastore:local
+    build:
+      context: ./infra/hive-metastore
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    logging: *logging
+    networks: [backend]
+    environment:
+      DB_DRIVER: postgres
+      SERVICE_NAME: metastore
+      # Вся конфигурация (postgres + S3-warehouse) — в hive-site.xml внутри
+      # образа: -D из SERVICE_OPTS не долетают до hadoop Configuration.
+    depends_on:
+      hive-metastore-db: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/9083'"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 90s
+
+  trino:
+    image: trinodb/trino:484
+    restart: unless-stopped
+    logging: *logging
+    networks: [backend]
+    # heap сам подстроится: -XX:MaxRAMPercentage=80 из образа → ~2.4 GiB
+    mem_limit: 3g
+    ports: ['127.0.0.1:8080:8080']
+    volumes:
+      - ./infra/trino/catalog/iceberg.properties:/etc/trino/catalog/iceberg.properties:ro
+    depends_on:
+      minio: {condition: service_healthy}
+      hive-metastore: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "trino", "--execute", "SELECT 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+
+  # ---- ДЗ-2: Kafka (KRaft, один брокер) + Debezium Connect ----
+
+  kafka:
+    image: apache/kafka:4.3.1
+    restart: unless-stopped
+    logging: *logging
+    networks: [backend]
+    environment:
+      CLUSTER_ID: 5L6g3nShT-eMCtK--x6HHA
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093,EXTERNAL://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    ports: ['127.0.0.1:9092:9092']
+    volumes: [kafka-data:/var/lib/kafka/data]
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:29092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 20s
+
+  kafka-connect:
+    # После 3.0.0.Final Debezium не публикуется в Docker Hub — официальный
+    # реестр quay.io.
+    image: quay.io/debezium/connect:3.7.0.Final
+    restart: unless-stopped
+    logging: *logging
+    networks: [backend]
+    environment:
+      BOOTSTRAP_SERVERS: kafka:29092
+      GROUP_ID: hw02-connect
+      CONFIG_STORAGE_TOPIC: connect-configs
+      OFFSET_STORAGE_TOPIC: connect-offsets
+      STATUS_STORAGE_TOPIC: connect-status
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+      KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      # envelope без обвязки connect-схем: {"before","after","op","source",...};
+      # entrypoint-образа переводит в properties только env с префиксом CONNECT_
+      CONNECT_KEY_CONVERTER_SCHEMAS_ENABLE: 'false'
+      CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE: 'false'
+      REST_ADVERTISED_HOST_NAME: kafka-connect
+    ports: ['127.0.0.1:8083:8083']
+    depends_on:
+      kafka: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8083/"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  cdc-init:
+    # Разовый: регистрирует 4 CDC-коннектора и ждёт завершения их снапшотов
+    # (маркер CDC SNAPSHOT DONE). Образ тот же, что у Connect: внутри есть
+    # python3 (stdlib) и kafka-cli (/kafka/bin) для подсчёта end-offsets.
+    image: quay.io/debezium/connect:3.7.0.Final
+    restart: 'no'
+    logging: *logging
+    networks: [backend]
+    working_dir: /workspace
+    volumes:
+      - ./scripts/infra:/workspace/scripts/infra:ro
+    environment:
+      CONNECT_URL: http://kafka-connect:8083
+      KAFKA_BOOTSTRAP: kafka:29092
+      KAFKA_BIN: /kafka/bin
+      DEBEZIUM_PASSWORD: ${DEBEZIUM_PASSWORD:-debezium}
+      CDC_SOURCES: /workspace/scripts/infra/cdc_sources.json
+      PYTHONUNBUFFERED: '1'
+    entrypoint: ["python3", "-u", "/workspace/scripts/infra/cdc_init.py"]
+    depends_on:
+      db-init: {condition: service_completed_successfully}
+      kafka: {condition: service_healthy}
+      kafka-connect: {condition: service_healthy}
+
+  dwh-init:
+    # Шаг 3 ДЗ-2: начальная загрузка DDS (образ tools: dbt-trino in-process).
+    # После CDC SNAPSHOT DONE ждёт, пока cdc-ingest догонит Kafka (условие
+    # маркера CDC RAW CAUGHT UP — водяные знаки против raw), запускает
+    # scripts/load_dds (порция без batch-id, UUID) и пишет маркер
+    # INITIAL DDS LOAD DONE. Затем обслуживание таблиц Iceberg (ADR-011:
+    # expire_snapshots/optimize/remove_orphan_files — снапшоты и мелкие
+    # файлы начальной загрузки) и финальный маркер ICEBERG MAINTENANCE
+    # DONE — чекер запускать после него. Идемпотентно при повторном up:
+    # когда kafka_positions уже покрывают raw, load_dds завершается no-op'ом
+    # (гейт «raw впереди позиций»), обслуживание на обслуженных таблицах —
+    # тоже no-op (optimize 0 файлов, снапшот не создаётся), маркеры пишутся.
+    <<: *tools
+    restart: 'no'
+    command:
+      - bash
+      - -c
+      - >-
+        python scripts/infra/wait_raw_caught_up.py &&
+        python scripts/load_dds &&
+        echo INITIAL DDS LOAD DONE &&
+        dbt test --project-dir dwh --profiles-dir dwh
+        --target-path /tmp/dwh-dbt-target --log-path /tmp/dwh-dbt-logs
+        --no-use-colors &&
+        python scripts/hw2/maintain_iceberg.py &&
+        echo ICEBERG MAINTENANCE DONE
+    depends_on:
+      cdc-init: {condition: service_completed_successfully}
+      trino: {condition: service_healthy}
+      cdc-ingest: {condition: service_started}
+
+  cdc-ingest:
+    # Шаг 2 ДЗ-2: доставка Kafka → iceberg.raw.cdc_events (at-least-once,
+    # дедуп на чтении — ADR-011). Батч BATCH_ROWS/FLUSH_SECONDS, offsets
+    # коммитятся строго после успешного INSERT; старт с earliest для новых
+    # групп/топиков. DDL raw/ctl и список топиков монтируются read-only:
+    # образ не зависит от их содержимого (up без --build не оставляет
+    # ingest на устаревшей подписке/схеме).
+    image: pharmacy-hw1-cdc-ingest:local
+    build:
+      context: .
+      dockerfile: infra/ingest/Dockerfile
+    restart: unless-stopped
+    stop_grace_period: 60s
+    logging: *logging
+    networks: [backend]
+    volumes:
+      - ./dwh/ddl/00_raw_ctl.sql:/app/ddl/00_raw_ctl.sql:ro
+      - ./scripts/infra/cdc_sources.json:/app/cdc_sources.json:ro
+    environment:
+      KAFKA_BOOTSTRAP: kafka:29092
+      GROUP_ID: cdc-ingest-raw
+      TRINO_HOST: trino
+      TRINO_PORT: '8080'
+      TRINO_USER: admin
+      TRINO_CATALOG: iceberg
+      BATCH_ROWS: '5000'
+      FLUSH_SECONDS: '5'
+      # клиент подставляет параметры в текст стейтмента с экранированием
+      # (JSON-payload инфлируется до ~15%), QUERY_TEXT_TOO_LARGE = 1 МБ —
+      # 850 КБ × 1.15 = 977 КБ < лимита, иначе детерминированный crash-loop
+      INSERT_BUDGET: '850000'
+    depends_on:
+      kafka: {condition: service_healthy}
+      trino: {condition: service_healthy}
+      # после маркера CDC SNAPSHOT DONE весь снапшот уже в Kafka — время
+      # загрузки raw измеряется чисто (от старта сервиса до CDC RAW CAUGHT UP)
+      cdc-init: {condition: service_completed_successfully}
+
 networks:
   backend:
     driver: bridge
@@ -216,3 +465,6 @@ volumes:
   etcd1-data:
   etcd2-data:
   etcd3-data:
+  minio-data:
+  hms-db-data:
+  kafka-data:

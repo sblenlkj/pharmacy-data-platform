@@ -1,0 +1,33 @@
+{
+  "crm": [
+    "customer",
+    "customer_profile_version",
+    "loyalty_level",
+    "consent",
+    "consent_type"
+  ],
+  "catalog": [
+    "sku",
+    "sku_version",
+    "sku_category",
+    "manufacturer",
+    "drug_form",
+    "active_ingredient",
+    "sku_active_ingredient",
+    "price_version",
+    "price_scope"
+  ],
+  "pos": [
+    "receipt",
+    "receipt_line",
+    "pharmacy"
+  ],
+  "wms": [
+    "purchase_order",
+    "purchase_line",
+    "movement",
+    "batch",
+    "supplier",
+    "distribution_center"
+  ]
+}
