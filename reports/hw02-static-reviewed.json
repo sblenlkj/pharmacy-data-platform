@@ -1,0 +1,171 @@
+{
+  "checks": {
+    "dds.sales": {
+      "status": "pass",
+      "points": 1,
+      "max": 1,
+      "detail": "v_sale_line"
+    },
+    "dds.purchases": {
+      "status": "pass",
+      "points": 1,
+      "max": 1,
+      "detail": "v_purchase_line"
+    },
+    "dds.movements": {
+      "status": "pass",
+      "points": 1,
+      "max": 1,
+      "detail": "v_movement"
+    },
+    "dds.dimensions": {
+      "status": "pass",
+      "points": 1,
+      "max": 1,
+      "detail": "v_sku, v_customer, v_pharmacy, v_batch, v_supplier, v_distribution_center"
+    },
+    "cdc.crm.snapshot": {
+      "status": "pass",
+      "points": 0.5,
+      "max": 0.5,
+      "detail": "8952 записей snapshot в raw"
+    },
+    "cdc.catalog.snapshot": {
+      "status": "pass",
+      "points": 0.5,
+      "max": 0.5,
+      "detail": "3532 записей snapshot в raw"
+    },
+    "cdc.pos.snapshot": {
+      "status": "pass",
+      "points": 0.5,
+      "max": 0.5,
+      "detail": "85158 записей snapshot в raw"
+    },
+    "cdc.wms.snapshot": {
+      "status": "pass",
+      "points": 0.5,
+      "max": 0.5,
+      "detail": "102663 записей snapshot в raw"
+    },
+    "cdc.crm.delta": {
+      "status": "skipped",
+      "points": null,
+      "max": 0.5,
+      "detail": "Нужен --scenario"
+    },
+    "cdc.catalog.delta": {
+      "status": "skipped",
+      "points": null,
+      "max": 0.5,
+      "detail": "Нужен --scenario"
+    },
+    "cdc.pos.delta": {
+      "status": "skipped",
+      "points": null,
+      "max": 0.5,
+      "detail": "Нужен --scenario"
+    },
+    "cdc.wms.delta": {
+      "status": "skipped",
+      "points": null,
+      "max": 0.5,
+      "detail": "Нужен --scenario"
+    },
+    "history.versions": {
+      "status": "skipped",
+      "points": null,
+      "max": 1,
+      "detail": "Нужен --scenario"
+    },
+    "history.privacy": {
+      "status": "skipped",
+      "points": null,
+      "max": 1,
+      "detail": "Нужен --scenario"
+    },
+    "incremental.delta": {
+      "status": "skipped",
+      "points": null,
+      "max": 1,
+      "detail": "Нужен --scenario"
+    },
+    "incremental.replay": {
+      "status": "skipped",
+      "points": null,
+      "max": 1,
+      "detail": "Нужен --scenario"
+    },
+    "incremental.batch_log": {
+      "status": "skipped",
+      "points": null,
+      "max": 1,
+      "detail": "Нужен --scenario"
+    },
+    "model.diagram": {
+      "status": "manual",
+      "points": null,
+      "max": 1,
+      "detail": "Проверяет преподаватель"
+    },
+    "model.dds": {
+      "status": "manual",
+      "points": null,
+      "max": 1,
+      "detail": "Проверяет преподаватель"
+    },
+    "model.mapping": {
+      "status": "manual",
+      "points": null,
+      "max": 1,
+      "detail": "Проверяет преподаватель"
+    },
+    "engine.start": {
+      "status": "manual",
+      "points": null,
+      "max": 1,
+      "detail": "Проверяет преподаватель"
+    },
+    "engine.initialize": {
+      "status": "manual",
+      "points": null,
+      "max": 1,
+      "detail": "Проверяет преподаватель"
+    },
+    "incremental.scope": {
+      "status": "manual",
+      "points": null,
+      "max": 1,
+      "detail": "Проверяет преподаватель"
+    },
+    "journal": {
+      "status": "manual",
+      "points": null,
+      "max": 1,
+      "detail": "Проверяет преподаватель"
+    },
+    "bonus.iceberg": {
+      "status": "manual",
+      "points": null,
+      "max": 2,
+      "detail": "Проверяет преподаватель"
+    },
+    "bonus.dbt": {
+      "status": "manual",
+      "points": null,
+      "max": 1,
+      "detail": "Проверяет преподаватель"
+    },
+    "bonus.solo": {
+      "status": "manual",
+      "points": null,
+      "max": 2,
+      "detail": "Проверяет преподаватель"
+    }
+  },
+  "automatic_points": 6.0,
+  "automatic_max": 13,
+  "manual_max": 7,
+  "bonus_max": 5,
+  "full_credit": 20
+}

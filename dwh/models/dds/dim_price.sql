@@ -7,8 +7,8 @@
 -- только из payload события — повтор порции воспроизводит их байт-в-байт
 -- (ADR-011: guarded-семантика без now()). Естественный ключ
 -- (sku, price_scope, scope_bk, valid_from) = merge-ключ.
--- Источник — stg_catalog_price_version в окне порции (версии, затронутые
--- событиями), справочник областей — полное состояние.
+-- Источник — обработанное состояние stg_catalog_price_version. Отбор по
+-- изменённым версиям или областям; старый replay не отменяет закрытие цены.
 select
     p.sku_bk as sku,
     ps.scope_name as price_scope,
@@ -20,3 +20,4 @@ select
     {{ lineage_columns('p') }}
 from {{ ref('stg_catalog_price_version') }} p
 join {{ ref('stg_catalog_price_scope') }} ps on ps.id = p.price_scope_id
+where {{ changed('p') }} or {{ changed('ps') }}

@@ -58,8 +58,10 @@
 #}
 {% macro batch_filter(alias='') -%}
  {%- set ranges = var('batch_ranges', none) -%}
- {%- if ranges is none or not ranges -%}
+ {%- if ranges is none -%}
 true
+ {%- elif not ranges -%}
+false
  {%- else -%}
  {%- set by_topic = {} -%}
  {%- for r in ranges -%}
@@ -80,74 +82,27 @@ true
 {%- endmacro %}
 
 {#
- Тело staging-обёртки над stg_cdc_events: строки одного маршрута
- (source_system.source_table), не позднее последнего события по ключу
- таблицы-источника (последний выигрывает по координатам Kafka
- «детерминизм SCD1 по (topic, partition_id, kafka_offset)»).
-
- Параметры:
- source_system, source_table — маршрут (dwh_mapping.md §9);
- source_pk — список колонок PK таблицы источника;
- body — список выражений «имя as колонка»;
- обязательно включает topic, partition_id,
- kafka_offset (lineage dim/fact, §10);
- filtered — окно порции (batch_ranges):
- true (по умолчанию) — обёртка отдаёт только
- ключи, затронутые в окне; для сборных
- справочников (dim_sku/dim_customer) и
- заголовков фактов с fallback на загруженные
- dim — false: полное состояние маршрута.
-
- Окно задано полуинтервалами [start_offset, end_offset) по каждому
- topic/partition; порции последовательны, поэтому «последнее в окне» =
- «последнее вообще» для затронутых ключей — merge в dds сходится.
- op='d' отбрасывается: физических delete в потоке нет (soft delete —
- UPDATE, dwh_mapping.md §5–7); tombstone ingest не пишет.
+ Текущее обработанное состояние, а не окно raw. История версионируемых
+ таблиц сохраняется отдельными PK. Фильтр порции применяется в DDS.
+ source_pk/filtered оставлены для совместимости с typed-wrapper вызовами.
 #}
 {% macro cdc_latest(source_system, source_table, source_pk, body, filtered=true) -%}
-{#- aliases of body items — for the outer projection (Trino has no * EXCLUDE) -#}
-{%- set cols = [] -%}
-{%- for item in body -%}
- {%- if ' as ' in item -%}
- {%- set _ = cols.append(item.split(' as ')[-1].strip()) -%}
- {%- else -%}
- {%- set _ = cols.append(item.strip()) -%}
- {%- endif -%}
-{%- endfor -%}
-with events as (
- select
- {{ body | join(',\n') }}
- from {{ ref('stg_cdc_events') }}
- {# Фильтр маршрута — по topic = <svc>.<schema.table> (не по
- source_system/source_table: topic входит в ключи окна дедупа
- stg_cdc_events, поэтому Trino проталкивает предикат ПОД
- window-оператор — иначе каждая обёртка гоняла бы окно дедупа по
- всему raw (200k payload-строк → OOM). #}
- where topic = '{{ source_system }}.{{ source_table }}'
- and op in ('r', 'c', 'u')
- {%- if filtered %}
- and {{ batch_filter() }}
- {%- endif %}
-),
-ranked as (
- select
- *,
- row_number() over (
- partition by {{ source_pk | join(', ') }}
- order by partition_id desc, kafka_offset desc
- ) as _rn
- from events
-)
 select
-{{ cols | join(',\n') }}
-from ranked
-where _rn = 1
+ {{ body | join(',\n') }}
+from {{ ref('stg_source_state') }}
+where topic = '{{ source_system }}.{{ source_table }}'
+  and op in ('r', 'c', 'u')
+{%- endmacro %}
+
+{# Поддерживает NULL от LEFT JOIN; пустое заданное окно = ни одной строки. #}
+{% macro changed(alias) -%}
+coalesce({{ batch_filter(alias ~ '.') }}, false)
 {%- endmacro %}
 
 {# Аудит-колонки lineage для dim/fact (dwh_mapping.md §10):
  основной источник — событие строки (e — алиас обёртки строки факта). #}
 {% macro lineage_columns(e, indent=' ') -%}
-{{ indent }}'{{ var("load_batch_id") }}' as _load_batch_id,
+{{ indent }}'{{ var("load_batch_id") | replace("'", "''") }}' as _load_batch_id,
 {{ indent }}{{ e }}.topic as _src_topic,
 {{ indent }}{{ e }}.partition_id as _src_partition,
 {{ indent }}{{ e }}.kafka_offset as _src_offset

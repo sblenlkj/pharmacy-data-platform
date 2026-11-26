@@ -100,3 +100,14 @@ PostgreSQL 16:
 [docs/failover_journal.md](failover_journal.md). Официальный чекер на этом
 стенде — 17/21, единственное расхождение `ha.running` задокументировано в
 [docs/infra/checker-compatibility.md](infra/checker-compatibility.md).
+
+## Исправления после ревью 24.11.2026
+
+Использовались официальные справочники синтаксиса и конфигурации:
+- Trino MERGE: https://trino.io/docs/484/sql/merge.html
+- dbt-trino incremental models: https://docs.getdbt.com/reference/resource-configs/trino-configs
+- Debezium PostgreSQL connector: https://debezium.io/documentation/reference/stable/connectors/postgresql.html
+
+Схема processed-state, фильтры зависимостей и регрессионные тесты добавлены
+при доработке с LLM. Docker-прогон исправленной версии ещё не выполнен;
+старые результаты выше относятся к предыдущим версиям.

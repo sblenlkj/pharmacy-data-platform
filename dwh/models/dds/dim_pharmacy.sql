@@ -3,7 +3,7 @@
 ) }}
 
 -- dim_pharmacy (SCD1): справочник аптек. Merge по pharmacy_bk (ADR-011);
--- источник — stg_pos_pharmacy в окне порции.
+-- источник — stg_pos_pharmacy из обработанного состояния.
 select
     p.pharmacy_bk,
     p.pharmacy_name,
@@ -15,3 +15,4 @@ select
     p.is_active,
     {{ lineage_columns('p') }}
 from {{ ref('stg_pos_pharmacy') }} p
+where {{ changed('p') }}

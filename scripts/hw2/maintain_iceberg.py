@@ -136,7 +136,10 @@ def discover_tables(conn):
                       "WHERE table_schema = 'ctl' AND table_type = 'BASE TABLE' "
                       "ORDER BY table_name")
     # ctl.* копят снапшот на каждый DML порции — обслуживаем вместе с DDS
-    return tables + [f"ctl.{r['table_name']}" for r in ctl] + [RAW_TABLE]
+    state = query(conn, f"SELECT table_name FROM {TRINO['catalog']}.information_schema.tables "
+                       "WHERE table_schema = 'dwh_staging' AND table_type = 'BASE TABLE'")
+    return (tables + [f"ctl.{r['table_name']}" for r in ctl]
+            + [f"dwh_staging.{r['table_name']}" for r in state] + [RAW_TABLE])
 
 
 def table_metrics(conn, table):

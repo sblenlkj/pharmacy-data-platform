@@ -37,14 +37,3 @@ CREATE TABLE IF NOT EXISTS iceberg.ctl.kafka_positions (
     partition_id  integer,
     next_offset   integer
 );
-
--- Справочник обогащения заголовка чека: pharmacy_bk достижим в источнике
--- только через receipt → shift → cash_register → pharmacy, а
--- shift/cash_register исключены из репликации (dwh_mapping.md §9).
--- Полностью пересинхронизируется scripts/load_dds из pos.contract.v_receipt
--- (когда затронут топик pos.public.receipt или справочник пуст); staging
--- stg_pos_receipt join-ит его без окна порции.
-CREATE TABLE IF NOT EXISTS iceberg.ctl.receipt_pharmacy (
-    receipt_bk   varchar,
-    pharmacy_bk  varchar
-);

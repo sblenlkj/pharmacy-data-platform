@@ -142,7 +142,8 @@ Publication и replica identity настраиваются в `scripts/infra/boo
 
 | Сущность / атрибут | Основной источник | Физическая таблица и ключ Kafka | Топик / raw | Таблица DDS и ключ | Представление и поле контракта |
 |---|---|---|---|---|---|
-| Позиция чека и атрибуты заголовка | POS | `receipt_line (receipt_bk, line_no)`; заголовок `receipt (receipt_bk)` | `pos.public.receipt_line`, `pos.public.receipt` | `fact_sale_line (receipt_bk, line_no)` | `v_sale_line`: все поля; заголовочные `pharmacy_bk`, `customer_bk`, `receipt_dt`, `doc_type`, `parent_receipt_bk`, `currency` — из события `receipt` |
+| Позиция чека и атрибуты заголовка | POS | `receipt_line (receipt_bk, line_no)`; заголовок `receipt (receipt_bk)` | `pos.public.receipt_line`, `pos.public.receipt` | `fact_sale_line (receipt_bk, line_no)` | `v_sale_line`: все поля; заголовочные `customer_bk`, `receipt_dt`, `doc_type`, `parent_receipt_bk`, `currency` — из события `receipt` |
+| Аптека строки продажи | POS | receipt.shift_bk → shift.register_bk → cash_register.pharmacy_bk | pos.public.receipt, pos.public.shift, pos.public.cash_register | fact_sale_line.pharmacy_bk | v_sale_line.pharmacy_bk, только через raw/state; PostgreSQL VIEW не используется |
 | Строка закупки | WMS | `purchase_line (purchase_bk, line_no)`; заголовок `purchase_order (purchase_bk)`; `received_at` — из `batch (batch_bk)` | `wms.public.purchase_line`, `wms.public.purchase_order` | `fact_purchase_line (purchase_bk, line_no)` | `v_purchase_line`: `supplier_bk`, `dc_bk`, `ordered_at` — из события `purchase_order` |
 | Движение партии | WMS | `movement (movement_bk)`; `sku` — из `batch (batch_bk)` | `wms.public.movement`, `wms.public.batch` | `fact_movement (movement_bk)` | `v_movement`: `sku` — справочник партий |
 | Товар и история | Каталог | `sku (sku_bk)`, `sku_version (id)`, `sku_category (id)`, `manufacturer (manufacturer_bk)`, `drug_form (drug_form_bk)`, `active_ingredient (ingredient_bk)`, `sku_active_ingredient (sku_bk, ingredient_bk)` | `catalog.public.*` (7 топиков выше) | `dim_sku (sku)` — SCD1-атрибуты; `dim_sku_version (sku, valid_from)` — единственный носитель имени/категории/Rx | `v_sku` — SCD1-атрибуты + открытая версия `dim_sku_version`; `v_sku_history` — версии имени, категории, Rx |
@@ -154,7 +155,7 @@ Publication и replica identity настраиваются в `scripts/infra/boo
 Исключения Debezium (в CDC не реплицируются): `crm.customer_contact`,
 `crm.contact_type` (контактные данные остаются в CRM по требованию
 приватности), `crm.loyalty_card` (карты лояльности в ДЗ-2 пропускаются),
-`pos.payment`, `pos.shift`, `pos.cash_register`, `pos.cashier`,
+`pos.payment`, `pos.cashier`,
 `wms.stock` (текущие остатки и способы оплаты в ДЗ-2 не требуются).
 
 ## 10. Ключи, lineage и время версий
@@ -163,7 +164,7 @@ Publication и replica identity настраиваются в `scripts/infra/boo
   товар в чеке, закупке и движении связывается по `sku`, партия — по
   `batch_bk`, клиент CRM ↔ чек POS — по `customer_bk`, аптека — по
   `pharmacy_bk`. Ключи Kafka (например, суррогатный `id` версии) используются
-  только как координаты события, бизнес-склейка идёт по BK из payload.
+  как идентификаторы физических строк raw/state; бизнес-склейка идёт по BK из payload.
 - **Lineage.** На каждой строке dim/fact: `_load_batch_id` — порция,
   впервые записавшая строку, и `_src_topic`, `_src_partition`,
   `_src_offset` — основной источник. Для составных фактов основной
@@ -172,8 +173,11 @@ Publication и replica identity настраиваются в `scripts/infra/boo
 - **Время версий.** `valid_from`/`valid_to` берутся из источников, где
   история существовала (`sku_version.valid_from`, `price_version.
   valid_from/valid_to`); `valid_to` версии SKU выводится как `valid_from`
-  следующей версии. Атрибуты только с текущим срезом (`city/region`
-  профиля, consent-признак) историзируются с первого снимка: `op='r'`
-  открывает версию с датой снимка; изменение атрибута без версий в
-  источнике закрывает версию моментом события.
+  следующей версии. CRM-профиль и согласия — текущий SCD1-срез, история этих
+  полей не заявляется. История имени/категории/Rx и цены — в таблицах выше.
+- **Обработанное состояние.** Все 25 физических топиков сначала
+  материализуются в dwh_staging.stg_source_state по Kafka PK. Typed
+  staging VIEW читают состояние, а DDS ограничивает кандидатов
+  изменениями любой влияющей зависимости. Поздний replay не заменяет
+  состояние событием с более ранним offset.
 - **Обработка идемпотентности** — [ADR 011](adr/011-history-replay-idempotency.md).
