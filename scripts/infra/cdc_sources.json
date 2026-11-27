@@ -20,7 +20,9 @@
   "pos": [
     "receipt",
     "receipt_line",
-    "pharmacy"
+    "pharmacy",
+    "shift",
+    "cash_register"
   ],
   "wms": [
     "purchase_order",

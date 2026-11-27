@@ -1,3 +1,10 @@
+> **Исторический журнал версии команды, до исправлений 24.11.2026.**
+> Здесь 23 топика и прежняя логика загрузчика; новая версия имеет 25 топиков.
+> Эти замеры и отчёт 13/13 не подтверждают исправленный код.
+> Для новой версии выполнены только offline-регрессии и dbt parse.
+> После запуска на Docker Desktop добавьте новый раздел с сырыми логами
+> и отчётом hw02-scenario-reviewed.json, не перезаписывая старые измерения.
+
 # Журнал загрузки DDS
 
 Движок и версия: Trino `trinodb/trino:484` + Iceberg (HMS) + MinIO. Модель:
@@ -230,7 +237,7 @@ month(receipt_dt/ordered_at/moved_at) (ADR-010), merge пишет только
 затронутые строки — новые дельта-строки ложатся в парции 2026-09/2026-10,
 существующие порции не читаются и не перезаписываются.
 
-Замечание о порядке повторов (наблюдение, не дефект): повтор порции
+Дефект прежней реализации, исправленный после ревью 24.11.2026: повтор порции
 воспроизводит её окно, поэтому внеочередной `--replay` старой порции
 поверх более новых состояний честно откатывает SCD1-атрибуты к состоянию
 окна (проверено: replay дельта-порции ПОСЛЕ history/privacy вернул
@@ -244,3 +251,310 @@ privacy-порций по порядку восстановил состояни
 replay): **13/13 за 3м43с** — быстрее
 приёмочных 4м10с; тайминги команд load в бюджете таймаута 90 с,
 деградации нет.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## Проверка исправленной версии после ревью — 26.11.2026
+
+### Цель и условия проверки
+
+Проверена версия после исправлений ревью: восстановление аптеки чека
+через CDC таблиц POS `shift` и `cash_register`, материализация
+обработанного состояния источников, пересчёт DDS по изменениям зависимостей
+и защита от отката более свежих данных при позднем replay.
+
+Среда: Windows, Docker Desktop, PowerShell.
+Compose project: `pharmacy-hw2-review`.
+
+Использован отдельный проект с новыми томами. Инициализация источников,
+начальный seed, настройка CDC и первая загрузка DDS выполнялись
+автоматически. В CDC включены 25 физических таблиц четырёх источников.
+
+Предыдущие разделы журнала описывают версию команды до ревью.
+Приведённые ниже результаты относятся к исправленной версии.
+
+### Команды запуска и проверки
+
+```powershell
+docker compose -p pharmacy-hw2-review up -d --build
+
+docker compose -p pharmacy-hw2-review logs -f --tail=200 dwh-init
+
+docker compose -p pharmacy-hw2-review ps -a
+
+docker compose -p pharmacy-hw2-review run --rm -T --no-deps tools python hws_descriptions/hw2/hw02_check.py --submission ./hw02_submission.container.yaml --json /reports/hw02-static-reviewed.json
+
+docker compose -p pharmacy-hw2-review run --rm -T --no-deps tools python hws_descriptions/hw2/hw02_check.py --submission ./hw02_submission.container.yaml --scenario --json /reports/hw02-scenario-reviewed.json
+
+docker compose -p pharmacy-hw2-review run --rm -T --no-deps tools python scripts/hw2/check_late_replay.py
+
+docker compose -p pharmacy-hw2-review run --rm -T --no-deps tools dbt test --project-dir dwh --profiles-dir dwh --target-path /tmp/dwh-dbt-target --log-path /tmp/dwh-dbt-logs
+
+docker compose -p pharmacy-hw2-review exec trino trino --execute "SELECT batch_id, status, offsets_json FROM iceberg.contract_dwh.v_load_batches"
+
+docker compose -p pharmacy-hw2-review exec trino trino --execute "SELECT batch_id, count(*) AS n FROM iceberg.contract_dwh.v_load_batches GROUP BY batch_id HAVING count(*) > 1"
+
+docker compose -p pharmacy-hw2-review logs --no-color db-init cdc-init cdc-ingest dwh-init | Out-File -Encoding utf8 .\reports\hw02-startup-reviewed.log
+```
+
+### Начальная доставка и загрузка DDS
+
+Начальный snapshot содержит 200 305 событий в 25 топиках:
+
+| Источник | Snapshot-событий в raw |
+|---|---:|
+| CRM | 8 952 |
+| Каталог | 3 532 |
+| POS | 85 158 |
+| WMS | 102 663 |
+| **Всего** | **200 305** |
+
+Границы первой порции: по каждому из 25 топиков от offset 0
+до сохранённого `end_offset`, правая граница не включается.
+Полный набор диапазонов сохранён в `v_load_batches.offsets_json`.
+
+Идентификатор первой порции:
+
+`baf995bb-8d33-49e4-a28a-16e254cf5606`
+
+Доставка raw достигла `lag=0` через 244,6 с от запуска ingest-процесса.
+Это время этапа доставки, а не полного запуска стенда.
+
+Выдержки из сырого вывода:
+
+```text
+cdc-init-1 | CDC SNAPSHOT DONE: 25 topics, 200305 records total
+
+cdc-ingest-1 | CDC RAW CAUGHT UP: total_rows=200305 batches=41 skipped=0 elapsed=244.6s lag=0
+
+dwh-init-1 | Finished running 12 incremental models, 39 view models in 0 hours 1 minutes and 53.32 seconds (113.32s).
+
+dwh-init-1 | Done. PASS=51 WARN=0 ERROR=0 SKIP=0 NO-OP=0 REUSED=0 TOTAL=51
+
+dwh-init-1 | load_dds: порция baf995bb-8d33-49e4-a28a-16e254cf5606 success; строк, впервые записанных этой порцией: 169511; позиции сохранены
+
+dwh-init-1 | load_dds: готово за 128.3 с (baf995bb-8d33-49e4-a28a-16e254cf5606)
+```
+
+Первая загрузка создала 169 511 строк в 11 таблицах DDS:
+
+| Таблица | Строк |
+|---|---:|
+| fact_sale_line | 63 525 |
+| fact_purchase_line | 5 400 |
+| fact_movement | 92 144 |
+| dim_customer | 2 200 |
+| dim_batch | 3 300 |
+| dim_price | 1 650 |
+| dim_sku_version | 687 |
+| dim_sku | 550 |
+| dim_pharmacy | 36 |
+| dim_supplier | 15 |
+| dim_distribution_center | 4 |
+| **Всего** | **169 511** |
+
+Дополнительно материализована таблица обработанного состояния
+`dwh_staging.stg_source_state`, содержащая после snapshot 200 305 строк.
+Она является техническим слоем и не включена в число строк DDS выше.
+
+Полная команда загрузчика заняла 128,3 с, включая dbt-прогон
+длительностью 113,32 с. После неё автоматически выполнены 24 dbt-теста
+и обслуживание Iceberg.
+
+Инициализация завершилась маркерами:
+
+```text
+INITIAL DDS LOAD DONE
+ICEBERG MAINTENANCE DONE
+```
+
+В выводе `docker compose ps -a` задачи `db-init`, `cdc-init` и `dwh-init`
+имеют статус `Exited (0)`. Постоянные сервисы продолжили работу.
+
+Вывод: начальная доставка и наполнение DDS выполнены автоматически;
+загрузчик завершился успешно и сохранил позиции обработки.
+
+### Новая порция и немедленный replay
+
+Официальный сценарий создал порцию:
+
+`18efef14a2744c2eaddcf5cc04e31f3b-delta`
+
+В Kafka и raw поступили 11 ожидаемых событий четырёх источников:
+
+| Источник | Ожидалось | Найдено в Kafka | Найдено в raw |
+|---|---:|---:|---:|
+| CRM | 2 | 2 | 2 |
+| Каталог | 3 | 3 | 3 |
+| POS | 2 | 2 | 2 |
+| WMS | 4 | 4 | 4 |
+| **Всего** | **11** | **11** | **11** |
+
+Границы порции, сохранённые в журнале.
+Для всех строк `partition = 0`, интервал — `[start_offset, end_offset)`:
+
+| Топик | start_offset | end_offset |
+|---|---:|---:|
+| catalog.public.price_version | 1650 | 1651 |
+| catalog.public.sku | 550 | 551 |
+| catalog.public.sku_version | 687 | 688 |
+| crm.public.customer | 2200 | 2201 |
+| crm.public.customer_profile_version | 2566 | 2567 |
+| pos.public.receipt | 21525 | 21526 |
+| pos.public.receipt_line | 63525 | 63526 |
+| wms.public.batch | 3300 | 3301 |
+| wms.public.movement | 92144 | 92145 |
+| wms.public.purchase_line | 5400 | 5401 |
+| wms.public.purchase_order | 1800 | 1801 |
+
+Чекер дождался доставки событий в raw, вызвал загрузчик с этим batch_id,
+а затем повторил ту же порцию с `--replay`.
+
+Результат:
+
+```text
+pass    incremental.delta            1/1  Новые ключи совпали с источниками, связи проверены
+pass    incremental.replay           1/1  Данные и версии не изменились
+pass    incremental.batch_log        1/1  Границы порции покрывают тестовые события и не изменились при повторе
+```
+
+Вывод: новая порция загрузилась в DDS; немедленный replay сохранил
+данные и версии, а также исходные границы порции.
+
+Отдельные длительности загрузки дельты и replay и число затронутых строк
+каждого MERGE в представленном выводе не раскрыты. Эти показатели
+не измерялись отдельно. Сценарий завершился без увеличения стандартного
+тайм-аута чекера.
+
+### История товара, цены и soft delete клиента
+
+После дельты официальный сценарий выполнил две порции:
+
+| batch_id | Диапазонов | Событий по границам offsets | Статус |
+|---|---:|---:|---|
+| 18efef14a2744c2eaddcf5cc04e31f3b-history | 2 | 4 | success |
+| 18efef14a2744c2eaddcf5cc04e31f3b-privacy | 1 | 1 | success |
+
+Результат проверок:
+
+```text
+pass    history.versions             1/1  Старые и новые версии доступны, снимок продажи прежний
+pass    history.privacy              1/1  Клиент скрыт, позиции чеков и суммы сохранены
+```
+
+Вывод: изменения товара и цены сохранили предыдущие версии и снимок
+старой продажи. Soft delete скрыл клиента из аналитического контракта,
+не удалив позиции чеков и их суммы.
+
+### Дополнительная регрессия позднего replay
+
+Выполнен отдельный тест с последовательностью:
+
+`delta → history → privacy → replay исходной delta`
+
+Идентификаторы его порций:
+
+| batch_id | Диапазонов | Событий по границам offsets | Статус |
+|---|---:|---:|---|
+| late-02fdfaa83fa4424e88e2964d2005d15f-delta | 11 | 11 | success |
+| late-02fdfaa83fa4424e88e2964d2005d15f-history | 2 | 4 | success |
+| late-02fdfaa83fa4424e88e2964d2005d15f-privacy | 1 | 1 | success |
+
+После history/privacy сохранены все 11 бизнес-представлений,
+затем повторена старая delta и выполнено сравнение результатов.
+
+Сырой вывод:
+
+```text
+PASS: old delta replay preserved all 11 business views; customer remains hidden
+```
+
+Вывод: поздний replay сохранил все бизнес-представления, включая историю
+цен и видимость клиентов. Более старые события не отменили последующие
+изменения. Это подтверждает исправление дефекта прежней реализации.
+
+### Повторная проверка целостности DDS
+
+После сценариев повторно выполнены dbt-тесты ключей, связей,
+истории и lineage:
+
+```text
+Finished running 24 data tests in 0 hours 0 minutes and 2.33 seconds (2.33s).
+
+Completed successfully
+Done. PASS=24 WARN=0 ERROR=0 SKIP=0 NO-OP=0 REUSED=0 TOTAL=24
+```
+
+Все 24 теста прошли. Время выполнения самих тестов — 2,33 с;
+это не полная длительность команды с запуском и разбором проекта dbt.
+
+### Проверка журнала порций
+
+После всех сценариев в `v_load_batches` присутствуют семь порций:
+начальная, три порции официального сценария и три порции дополнительного
+теста. Все имеют статус `success`.
+
+Запрос:
+
+```sql
+SELECT batch_id, count(*) AS n
+FROM iceberg.contract_dwh.v_load_batches
+GROUP BY batch_id
+HAVING count(*) > 1;
+```
+
+вернул пустой результат. Повторы не создали дополнительных строк
+журнала с тем же batch_id.
+
+### Итог и подтверждающие материалы
+
+- Статическая проверка: **6/13**, остальные сценарные пункты пропущены.
+- Полный официальный сценарий: **13/13 автоматических баллов**.
+- Дополнительная регрессия позднего replay: **PASS**.
+- Повторные dbt-тесты: **24/24**.
+- Автоматическая инициализация: завершена, одноразовые задачи `Exited (0)`.
+- Дубли batch_id в журнале: не обнаружены.
+
+Материалы прогона:
+
+- [Полный консольный вывод](../reports/hw02-console-reviewed.txt).
+- [Логи автоматической инициализации](../reports/hw02-startup-reviewed.log).
+- [Статический JSON-отчёт](../reports/hw02-static-reviewed.json).
+- [Сценарный JSON-отчёт](../reports/hw02-scenario-reviewed.json).
+
+В логах присутствует предупреждение dbt о настройках проверки
+SSL-сертификатов. Оно не привело к ошибке выполнения; показатель
+`WARN=0` в итоговой строке относится к результатам тестов.
+
+Исправленная версия прошла функциональную проверку на Trino/Iceberg.
+Проектирование модели, ограниченность обработки, полнота журнала
+и бонусные критерии остаются предметом ручной оценки преподавателя.
+Отдельные длительности сценарных загрузок и физические планы выполнения
+в этом прогоне не зафиксированы.
+
+
+
+## Подтверждение на реальном стенде — 26.11.2026
+
+Исправленная версия проверена на Docker Desktop с Trino/Iceberg.
+Автоматическая инициализация завершилась успешно; официальный сценарий
+получил 13/13, дополнительный тест позднего replay прошёл, повторные
+dbt-тесты — 24/24. Подробности и материалы нового прогона приведены
+в разделе от 26.11.2026 файла docs/load_journal.md.

@@ -3,7 +3,7 @@
 ) }}
 
 -- dim_supplier (SCD1): справочник поставщиков. Merge по supplier_bk
--- (ADR-011); источник — stg_wms_supplier в окне порции.
+-- (ADR-011); источник — stg_wms_supplier из обработанного состояния.
 select
     s.supplier_bk,
     s.supplier_name,
@@ -11,3 +11,4 @@ select
     s.is_active,
     {{ lineage_columns('s') }}
 from {{ ref('stg_wms_supplier') }} s
+where {{ changed('s') }}

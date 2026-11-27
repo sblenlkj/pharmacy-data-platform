@@ -1,251 +1,163 @@
 # Pharmacy data platform
 
-ДЗ-2 — текущая сдача (ветка `hw2`): детальный слой хранилища — CDC четырёх
-PostgreSQL-источников → raw (Iceberg) → DDS (dbt, dimensional) → представления
-контракта; стек MinIO + Trino + Hive Metastore + Kafka/Debezium.
-
-ДЗ-1 — четыре PostgreSQL-источника аптечной сети и учебный HA-стенд,
-раздел ниже.
+ДЗ-2: четыре PostgreSQL → Debezium → Kafka → raw Iceberg → обработанное
+состояние источников → DDS dbt → contract_dwh.
 
 Участники: Кауров Александр, Каневский Дмитрий, Бичурина Елизавета, Ляхов Артем.
 
-## ДЗ-2: лейкхаус MinIO + Trino + Iceberg + CDC (ветка `hw2`)
+## Состояние после ревью 24.11.2026
 
-### Выбранный стек (подтверждён spike 1 и рабочим стендом, 2026-11-15/16)
+Исправлены обогащение чека из контрактного VIEW PostgreSQL, потеря связей
+между порциями, отсутствие пересчёта по изменениям зависимых таблиц и
+откат приватности при позднем replay. Изменения и проверка:
+[docs/hw2_review.md](docs/hw2_review.md).
 
-| Компонент | Версия | Роль |
-|---|---|---|
-| Trino | `trinodb/trino:484`, каталог `iceberg` | OLAP-движок |
-| Каталог Iceberg | **Hive Metastore**: `apache/hive:4.0.1` (standalone metastore, jar'ы докладываются в образ) + backing-БД `postgres:16.16-alpine3.23` | метаданные Iceberg |
-| S3 | MinIO `bitnamilegacy/minio:2025.7.23-debian-12-r5` (официальный `minio/minio` удалён из Docker Hub в сентябре 2026) | object storage, бакет `lakehouse` |
-| Kafka | `apache/kafka:4.3.1`, один брокер, KRaft (combined broker+controller), listeners: `kafka:29092` internal / `localhost:9092` external | шина CDC |
-| Debezium Connect | `quay.io/debezium/connect:3.7.0.Final` (Kafka client 4.3.1; после 3.0.0.Final Debezium не публикуется в Docker Hub — официальный реестр quay.io) | 4 Postgres-коннектора, `pgoutput` |
-| Наполнение | dbt: `dbt-trino==1.12.0` (dbt-core 1.12.7) — в образе `tools`, запуск in-process | dbt-проект dwh/ |
-| Доставка raw | `cdc-ingest` (собственный образ `python:3.12-slim`, `confluent-kafka==2.16.1` + `trino==0.340.0`) | Kafka → `raw.cdc_events` |
-| Загрузка DDS | `scripts/load_dds` (python; dbt через `dbtRunner` in-process, `--select` только затронутых веток) | raw → DDS порциями с merge-идемпотентностью |
+**Новая версия ещё не запускалась в Docker/Trino.** Старые 13/13 в
+reports/hw02-scenario-final.json и замеры в docs/load_journal.md относятся
+к версии команды. После исправлений нужен новый чистый прогон;
+его результаты нельзя подменять прежним отчётом.
 
-Драйверы HMS (`postgresql`, `hadoop-aws`, `aws-java-sdk-bundle`, 296 МБ) в
-репозитории не хранятся: `infra/hive-metastore/Dockerfile` скачивает их с
-Maven Central при сборке с проверкой sha256 (бит-в-бит те же файлы, что
-прошли spike 1 и рабочий прогон). Для сборки нужна сеть — как и для `FROM`-образов.
+## Стек ДЗ-2
 
-Все образы запинены. Решения и ограничения переноса:
-[ADR 010](docs/adr/010-lakehouse-engine-partitioning.md),
-[ADR 011](docs/adr/011-history-replay-idempotency.md).
+| Компонент | Версия |
+|---|---|
+| Trino, каталог iceberg | trinodb/trino:484 |
+| Iceberg, Hive Metastore | apache/hive:4.0.1 + драйверы из Maven с проверкой SHA256 |
+| База метаданных HMS | postgres:16.16-alpine3.23 |
+| S3 | bitnamilegacy/minio:2025.7.23-debian-12-r5, бакет lakehouse |
+| Kafka | apache/kafka:4.3.1, KRaft, один брокер и одна партиция на топик |
+| Debezium | quay.io/debezium/connect:3.7.0.Final |
+| dbt | dbt-trino==1.12.0, dbt-core==1.12.7 |
 
-### Что делает `docker compose up -d`
+Модель: dimensional, 8 dim + 3 fact. ERD:
+[бизнес-слой](docs/erd/dds.mmd), [технический путь](docs/erd/dds_tech.mmd).
+Партиции фактов — месяц события; состояние источников — по topic;
+обоснование — ADR 009–011.
 
-Никаких ручных команд, кроме одной. На чистых volumes:
+## Запуск на чистом стенде
 
-1. поднимается стенд ДЗ-1 (Patroni×3, HAProxy, PgBouncer) и OLAP-стек ДЗ-2
-   (`minio`, `hive-metastore-db`, `hive-metastore`, `trino`; порты
-   9000/9001/8080);
-2. **db-init** (tools) применяет миграции, создаёт роль `debezium`
-   (`LOGIN REPLICATION`, `GRANT CONNECT/SELECT` на 4 БД и таблицы CDC),
-   создаёт publication'ы `pub_cdc_{crm,catalog,pos,wms}` по
-   [dwh_mapping.md §9](docs/dwh_mapping.md) (единый источник —
-   `scripts/infra/cdc_sources.json`, 23 таблицы) и, если источники пусты,
-   запускает базовый сид генератора (`DATA_SEED`, по умолчанию 42);
-3. **cdc-init** (one-shot, тот же образ, что Connect) регистрирует через
-   Kafka Connect REST 4 коннектора `cdc-{crm,catalog,pos,wms}`
-   (`pgoutput`, `snapshot.mode=initial`, `topic.prefix` = имя сервиса,
-   `table.include.list` из §9, подключение к лидеру через `haproxy:5000`),
-   ждёт, пока каждый коннектор/tasks = RUNNING и end-offsets всех 23 топиков
-   `{svc}.public.{table}` станут ненулевыми и стабильными, и пишет в лог
-   маркер **`CDC SNAPSHOT DONE`** — начальный снимок источников уже в Kafka;
-4. **cdc-ingest** (python, confluent-kafka + trino) читает 23 топика группы
-   `cdc-ingest-raw` с earliest, батчами по 5000 строк (или 5 с) пишет
-   `raw.cdc_events` (payload — полный envelope Debezium для переобработки),
-   offsets коммитит строго после успешного INSERT — доставка at-least-once,
-   дедуп по `(topic, partition_id, kafka_offset)` на чтении (ADR-011). По
-   догону до lag=0 пишет в лог маркер **`CDC RAW CAUGHT UP`** (снапшот
-   200 233 события, 211–321 с по журналам). DDL raw/ctl применяет сам при старте
-   (идемпотентно);
-5. **dwh-init** (one-shot, образ `tools` с dbt-trino) — начальная загрузка
-   DDS: ждёт, пока cdc-ingest догонит Kafka (условие маркера
-   `CDC RAW CAUGHT UP` — водяные знаки Kafka против максимумов offsets в
-   raw, `scripts/infra/wait_raw_caught_up.py`), затем запускает
-   `scripts/load_dds` (порция без batch-id, UUID) и пишет в лог маркер
-   **`INITIAL DDS LOAD DONE`**. Представления контракта (включая
-   `v_cdc_events`, `v_load_batches`) разворачивает тот же dbt-прогон.
-   После маркера — обслуживание таблиц Iceberg
-   (`scripts/hw2/maintain_iceberg.py`: expire_snapshots / optimize /
-   remove_orphan_files, ADR-011) и финальный маркер
-   **`ICEBERG MAINTENANCE DONE`** — чекер запускать после него.
-
-**Признак завершения начальной загрузки** (после `up -d`, вернувшегося
-раньше): строка первой порции со статусом `success` в
-`contract_dwh.v_load_batches` + маркер `INITIAL DDS LOAD DONE` (и затем
-`ICEBERG MAINTENANCE DONE`) в логе dwh-init. Замер на чистых томах
-(приёмочный прогон 2026-11-17):
-**~8 минут** от запуска `docker compose up -d --build` до маркера
-(включая сборку образов и весь снапшот; снапшот успевает внутри окна
-`up -d`, дальше ~5.5 мин — догрузка raw, порция DDS и обслуживание):
+Из корня репозитория, Docker Desktop запущен и использует Linux containers:
 
 ```bash
-docker compose logs dwh-init | grep -e "INITIAL DDS LOAD DONE" -e "ICEBERG MAINTENANCE DONE"
-docker compose exec trino trino --execute \
-  "SELECT batch_id, status, json_extract_scalar(offsets_json,'$[0].topic') AS first_topic
-   FROM iceberg.contract_dwh.v_load_batches"
+docker compose up -d
+docker compose logs -f dwh-init
 ```
 
-Повторный `up -d` на живом стенде идемпотентен: миграции скипаются по ledger,
-сид не запускается (источники непустые), конфиги коннекторов перезаписываются
-те же (Connect не перезапускает их при неизменном конфиге), offsets в Kafka
-сохраняются — повторного снапшота нет. dwh-init перезапускается, но его гейт
-«raw впереди позиций» сворачивает загрузку в no-op (`kafka_positions` уже
-покрывают raw → «новых событий нет»), обслуживание Iceberg повторно — тоже
-no-op (optimize переписывает 0 файлов, снапшот не создаётся), маркеры
-пишутся всё равно. Если на
-момент `up -d` в raw накопились недогруженные события (например, delta),
-dwh-init честно загружает их новой порцией.
+Compose автоматически применит миграции ДЗ-1, выполнит seed, зарегистрирует
+4 коннектора с 25 физическими таблицами (включая POS shift/cash_register),
+доставит raw и выполнит первую загрузку и dbt-тесты. Окончательный маркер:
+**ICEBERG MAINTENANCE DONE**. Статус первой порции в v_load_batches —
+success. Ctrl+C при просмотре logs закрывает только просмотр.
 
-### Запуск чекера с хоста (альтернатива контейнерному режиму)
+Если на этом компьютере остался стенд ДЗ-1, остановите его без удаления
+данных. Для независимых новых томов добавляйте `-p pharmacy-hw2-review`
+**ко всем** командам compose ниже. Для пересборки имеющихся локальных
+образов используйте `up -d --build`. Одна лишь смена имени проекта
+не освобождает занятые старым стендом порты.
 
-Основной режим — в контейнере tools (WSL2 не видит host-порты). На обычном
-Linux-хосте работает прямой вызов:
+После изменения списка CDC-таблиц проверяйте эту версию на новых томах:
+обычное обновление уже завершившего snapshot коннектора не создаёт
+начальные события для добавленных shift/cash_register. Автоматическая
+миграция старого DDS в новую схему состояния не реализована.
+`down -v` удаляет данные выбранного проекта; для проверки удобнее
+выбрать новое имя проекта и сохранить старые тома.
 
+Первый запуск скачивает образы, Python-пакеты и HMS-драйверы из Maven.
+Замер прежней версии — около 8 минут; время новой версии ещё не измерено.
+
+## Переменные окружения
+
+Копировать .env.example необязательно, значения по умолчанию работают.
+
+| Переменная | Значение по умолчанию | Назначение |
+|---|---|---|
+| POSTGRES_PASSWORD | postgres | администратор PostgreSQL |
+| REPLICATION_PASSWORD | replicator | физическая репликация |
+| APP_PASSWORD | app | запись тестовых данных |
+| CHECKER_PASSWORD | checker | чтение контрактов источников |
+| PATRONI_API_PASSWORD | patroni | Patroni REST |
+| DATA_SEED | 42 | namespace начального генератора |
+| DEBEZIUM_PASSWORD | debezium | CDC-роль |
+| COMPOSE_PROJECT_NAME | pharmacy-hw1 | существующее имя проекта; -p имеет приоритет |
+
+Trino/Kafka endpoints, MinIO minioadmin/minioadmin и HMS hive/hivepass —
+учебные константы в compose и конфигурации. Список всех подставляемых
+переменных — в .env.example. При изменении CHECKER_PASSWORD меняйте
+DSN хостового чекера соответственно. Контейнер tools получает DSN сам.
+
+Порты хоста: Trino 8080, Kafka 9092, Connect 8083, MinIO 9000/9001,
+PostgreSQL через PgBouncer RW 6432. Python/dbt на хосте для основного
+пути ниже не нужны.
+
+## Проверка в Docker Desktop
+
+После финального маркера запустите официальный чекер:
+
+```bash
+docker compose run --rm -T --no-deps tools python hws_descriptions/hw2/hw02_check.py --submission ./hw02_submission.container.yaml --scenario --json /reports/hw02-scenario-reviewed.json
+```
+
+Ожидаемый результат — 13/13, **ещё не подтверждён для этой версии**.
+Сценарий создаёт данные и выполняет soft delete тестового клиента.
+Без --scenario проверка только читает данные: ожидается 6/13.
+При тайм-ауте на слабой машине есть --timeout 180; для сравнения
+с приёмкой сначала проверяйте стандартные 90 секунд.
+
+Отдельная проверка исходного дефекта позднего replay:
+```bash
+docker compose run --rm -T --no-deps tools python scripts/hw2/check_late_replay.py
+```
+Она также пишет тестовые данные. Порядок: delta → history → privacy →
+replay старой delta, затем сравнение всех 11 бизнес-представлений.
+Не запускайте её одновременно с официальным сценарием.
+
+Отдельные dbt-тесты и диагностика:
+```bash
+docker compose run --rm -T --no-deps tools dbt test --project-dir dwh --profiles-dir dwh --target-path /tmp/dwh-dbt-target --log-path /tmp/dwh-dbt-logs
+docker compose ps -a
+docker compose logs --tail=100 db-init cdc-init cdc-ingest dwh-init
+```
+
+Exited (0) для одноразовых задач db-init/cdc-init/dwh-init — нормально.
+Остановить с сохранением данных: `docker compose down`.
+
+## Хостовый чекер преподавателя
+
+Контейнерный манифест адресует сервисы Compose. Основной
+hw02_submission.yaml адресует localhost; команды fixture/load в нём
+теперь сами запускают tools через Docker, с передачей stdin JSON.
+Хосту нужны только зависимости официального чекера, а не локальный dbt.
+
+Пример для Bash, после старта стенда:
 ```bash
 python3 -m pip install -r hws_descriptions/hw2/requirements.txt
-export HW02_CRM_DSN='postgresql://checker:checker@localhost:6432/crm_service_db'  # + catalog/pos/wms
-python3 hws_descriptions/hw2/hw02_check.py --submission hw02_submission.yaml --scenario
+export HW02_CRM_DSN='postgresql://checker:checker@localhost:6432/crm_service_db'
+export HW02_CATALOG_DSN='postgresql://checker:checker@localhost:6432/catalog_service_db'
+export HW02_POS_DSN='postgresql://checker:checker@localhost:6432/pos_service_db'
+export HW02_WMS_DSN='postgresql://checker:checker@localhost:6432/wms_service_db'
+python3 hws_descriptions/hw2/hw02_check.py --submission ./hw02_submission.yaml --scenario --json reports/hw02-host-reviewed.json
 ```
+Если использовали нестандартное имя проекта, экспортируйте соответствующий
+COMPOSE_PROJECT_NAME, чтобы вложенные команды манифеста адресовали тот же
+стенд. В PowerShell для переменных используется `$env:ИМЯ = 'значение'`.
 
-Манифест `hw02_submission.yaml` адресует хост (localhost:6432/8080/9092);
-`commands.load`/`commands.fixture` исполняются при этом на хосте и требуют
-локального python с зависимостями стенда (dbt-trino, psycopg2,
-confluent-kafka) — поэтому рекомендованный путь остаётся контейнерным.
-
-### Переменные окружения
-
-| Переменная | Назначение | Значение стенда |
-|---|---|---|
-| `DATA_SEED` | namespace автоматического базового сида (db-init) | `42` |
-| `DEBEZIUM_PASSWORD` | пароль роли `debezium` | `debezium` |
-| `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD` | учётка MinIO | `minioadmin` / `minioadmin` (константа в compose) |
-| `MINIO_DEFAULT_BUCKETS` | бакет, создаваемый при старте | `lakehouse` |
-| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | backing-БД HMS | `hive` / `hivepass` / `hive_metastore` |
-| `DB_DRIVER` / `SERVICE_NAME` | режим контейнера HMS | `postgres` / `metastore` |
-
-S3-параметры (endpoint, ключи, region, path-style) задаются не через env,
-а в `iceberg.properties` Trino и `hive-site.xml` HMS — так надёжно
-(причины — ADR 010).
-
-### Как убедиться, что коннекторы заснапшотили
+## Порции, replay и восстановление
 
 ```bash
-# 1) маркер в логе cdc-init (ждёт снапшоты сам, up уже вернулся раньше)
-docker compose logs cdc-init | grep "CDC SNAPSHOT DONE"
-
-# 2) все 23 топика непустые: сумма end-offsets
-docker compose exec kafka-connect bash -c \
-  'for t in $(/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --list | grep public | sort); do \
-     printf "%-40s %s\n" "$t" "$(/kafka/bin/kafka-get-offsets.sh --bootstrap-server kafka:29092 --topic "$t" | cut -d: -f3 | awk "{s+=\$1} END {print s}")"; \
-   done'
-
-# 3) envelope: op="r" (snapshot-записи) и source.schema/source.table
-docker compose exec kafka-connect bash -c \
-  '/kafka/bin/kafka-console-consumer.sh --bootstrap-server kafka:29092 \
-    --topic crm.public.customer --from-beginning --max-messages 1 --timeout-ms 10000'
-
-# 4) снапшот доставлен в raw: маркер ingest + сверка с источниками
-docker compose logs cdc-ingest | grep "CDC RAW CAUGHT UP"
-python3 scripts/hw2/check_raw_snapshot.py   # 5/5 pass = cdc.*.snapshot чекера
+docker compose run --rm -T --no-deps tools python scripts/load_dds
+docker compose run --rm -T --no-deps tools python scripts/load_dds --batch-id my-batch
+docker compose run --rm -T --no-deps tools python scripts/load_dds --batch-id my-batch --replay
 ```
 
-Ожидаемый envelope (schemaless JSON, `VALUE_CONVERTER_SCHEMAS_ENABLE=false`):
-`{"before":null,"after":{...},"op":"r","source":{"schema":"public","table":"customer",...},...}`;
-ключ записи — PK таблицы. Порты для хоста: Kafka `localhost:9092`,
-Connect REST `localhost:8083`, Trino `localhost:8080`, MinIO `localhost:9000/9001`.
+Повторный batch_id не обозначает новую порцию. При ошибке или остановке
+смотрите сохранённый ID в журнале/логе и повторяйте именно его.
+Новая порция заблокирована до восстановления предыдущей.
+Подробности: [dwh/README.md](dwh/README.md), [ADR 011](docs/adr/011-history-replay-idempotency.md).
 
-### Как проверить загрузку DDS
-
-```bash
-# 1) признак завершения начальной загрузки и обслуживания Iceberg
-#    (см. выше — раздел «Что делает up -d»)
-docker compose logs dwh-init | grep -e "INITIAL DDS LOAD DONE" -e "ICEBERG MAINTENANCE DONE"
-
-# 2) официальный чекер, статические проверки (dds.*, cdc.*.snapshot):
-#    метаданные 13 представлений, значения, интервалы версий
-docker compose run --rm -T --no-deps tools \
-  python hws_descriptions/hw2/hw02_check.py \
-    --submission ./hw02_submission.container.yaml
-# ожидание: 6/13 автоматически (остальное — режим --scenario и ручные пункты)
-
-# 3) dbt-тесты DDS: ключи (уникальность/NOT NULL, составные — сингулярными),
-#    связи на dim_*, инварианты истории (интервалы без пересечений, одна
-#    открытая версия) и lineage (_load_batch_id)
-docker compose run --rm -T --no-deps tools bash -c \
-  "dbt test --project-dir dwh --profiles-dir dwh \
-   --target-path /tmp/dwh-dbt-target --log-path /tmp/dwh-dbt-logs --no-use-colors"
-
-# 4) контрольные суммы DDS для теста идемпотентности повтора порции
-docker compose run --rm -T --no-deps tools \
-  python scripts/hw2/warehouse_checksum.py
-
-# 5) обслуживание таблиц Iceberg (expire_snapshots/optimize/orphans) —
-#    тот же запуск, что в dwh-init после начальной загрузки (ADR-011)
-docker compose run --rm -T --no-deps tools \
-  python scripts/hw2/maintain_iceberg.py
-```
-
-### Самопроверка ДЗ-2: официальный чекер (static + scenario)
-
-Обе проверки запускаются из контейнера `tools` (DSN источников и Trino
-заданы в environment сервиса, манифест — сетевой, с именами сервисов).
-JSON-отчёты пишутся в примонтированный `./reports`:
-
-```bash
-# статические проверки (dds.*, cdc.*.snapshot): ожидание 6/13
-docker compose run --rm -T --no-deps tools \
-  python hws_descriptions/hw2/hw02_check.py \
-    --submission ./hw02_submission.container.yaml \
-    --json /reports/hw02-static.json
-
-# полный сценарий (fixture → load → replay → history → privacy): 13/13
-docker compose run --rm -T --no-deps tools \
-  python hws_descriptions/hw2/hw02_check.py \
-    --submission ./hw02_submission.container.yaml \
-    --scenario \
-    --json /reports/hw02-scenario.json
-```
-
-Сценарий занимает ~4 мин: чекер сам пишет тестовые данные командой
-`scripts/check_fixture`, загружает порции `scripts/load_dds` (контракты
-`commands.fixture`/`commands.load` манифеста) и сверяет сырьё, DDS,
-журнал порций, версии и приватность. Итог сверяется со строкой
-`Подтверждено автоматически: 13/13`; ручные пункты (model.*, engine.*,
-incremental.scope, journal) проверяет преподаватель.
-
-### Отказоустойчивость CDC: рестарт PG-кластера
-
-Коннекторы подключаются к лидеру через `haproxy:5000`. Логические слоты
-`cdc_{crm,catalog,pos,wms}` переживают рестарт кластера и смену лидера без
-повторного снапшота — двумя настройками:
-
-- **`permanent_slots` у Patroni** (`infra/patroni/patroni.yml`,
-  `bootstrap.dcs.permanent_slots` — в Patroni 4.1 ключ именно верхнего
-  уровня динамической конфигурации): Patroni держит слоты на лидере,
-  синхронизирует их с репликами и пересоздаёт на новом лидере после
-  рестарта/перевыборов. Важно: ключ в секции `postgresql` Patroni 4.1
-  игнорирует (сверено с кодом 4.1.0 в образе).
-- **`offset.mismatch.strategy=trust_slot` у Debezium** (прописан в
-  `scripts/infra/cdc_init.py`): слот считается источником истины, оффсет
-  коннектора догоняет позицию пересозданного слота; проверка «stored LSN
-  недоступен» отключается самой стратегией. Без неё задача коннектора после
-  пересоздания слота падает «LSN no longer available» и не поднимается.
-
-Проверено 2026-11-17: полный
-stop/start postgres1–3 — коннекторы восстанавливаются сами за ~30 с
-(задачи даже не уходят в FAILED); принудительный дроп всех четырёх слотов —
-Patroni пересоздаёт их за ~10 c, задачи Debezium переподнимаются сами
-(внутренние ретраи) за ~20 c, повторного снапшота нет, новые события
-доезжают до raw за секунды.
-
-Остальные особенности CDC: heartbeat отключён — при долгом отсутствии
-изменений WAL на источнике удерживается слотом (на объёмах ДЗ некритично);
-`decimal.handling.mode=string`, `tombstones.on.delete=false` — чтобы
-JSON-envelope было удобно парсить загрузчику DDS.
+Результаты нового запуска допишите в [docs/load_journal.md](docs/load_journal.md):
+команды, сырые логи, batch_id, реальные границы, длительность,
+число новых/изменённых строк, результат replay. Не переносите туда старые
+тайминги как измерения исправленного кода.
 
 ---
 

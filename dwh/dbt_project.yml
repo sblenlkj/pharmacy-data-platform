@@ -19,9 +19,8 @@ vars:
 models:
   dwh:
     staging:
-      # Обёртки над raw.cdc_events: дедуп доставки + разбор payload.
-      # Окно порции — макрос batch_filter; справочники-спутники
-      # (справочники/версии профилей/согласия) идут без окна (filtered=false).
+      # Typed views read durable stg_source_state. Only that model is a table
+      # (dwh_staging schema, guarded incremental merge from the saved raw window).
       +materialized: view
     dds:
       # Партиционирование фактов: факты month(<время факта>),

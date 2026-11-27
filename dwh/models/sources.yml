@@ -23,9 +23,3 @@ sources:
         description: Журнал порций (batch_id, offsets_json, status).
       - name: kafka_positions
         description: Позиция обработки (topic, partition_id, next_offset).
-      - name: receipt_pharmacy
-        description: >
-          Справочник receipt_bk → pharmacy_bk (обогащение заголовка чека):
-          маршрут receipt → shift → cash_register → pharmacy исключён из
-          репликации (dwh_mapping.md §9), значения синхронизирует
-          scripts/load_dds из pos.contract.v_receipt.

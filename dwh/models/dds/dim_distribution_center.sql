@@ -4,7 +4,7 @@
 
 -- dim_distribution_center (SCD1): справочник распредцентров.
 -- Merge по dc_bk (ADR-011); источник — stg_wms_distribution_center
--- в окне порции.
+-- из обработанного состояния.
 select
     d.dc_bk,
     d.dc_name,
@@ -13,3 +13,4 @@ select
     d.is_active,
     {{ lineage_columns('d') }}
 from {{ ref('stg_wms_distribution_center') }} d
+where {{ changed('d') }}

@@ -249,7 +249,7 @@ One-shot оркестратор CDC (ДЗ-2), сервис `cdc-init` (обра�
    `pgoutput`, `snapshot.mode=initial`, `topic.prefix` = сервис,
    `table.include.list` из `cdc_sources.json`, лидер через `haproxy:5000`;
 3. ждёт RUNNING у connector/tasks и стабильные ненулевые end-offsets
-   всех 23 топиков `{svc}.public.{table}`;
+   всех 25 топиков `{svc}.public.{table}`;
 4. пишет в лог маркер `CDC SNAPSHOT DONE`.
 
 ---
@@ -261,22 +261,12 @@ One-shot оркестратор CDC (ДЗ-2), сервис `cdc-init` (обра�
 
 - `wait_raw_caught_up.py` ждёт эквивалент маркера cdc-ingest
   `CDC RAW CAUGHT UP`: водяные знаки Kafka (confluent-kafka) совпадают
-  с максимумами offsets в `raw.cdc_events` по всем 23 топикам;
-- `load_dds` (контракт `commands.load` чекера ДЗ-2, запуск и человеком):
-  - без аргументов — новая порция (batch_id=UUID), диапазоны
-    `[ctl.kafka_positions, max(raw))`;
-  - `--batch-id ID` — то же с переданным идентификатором;
-  - `--batch-id ID --replay` — применить сохранённые в `ctl.load_batches`
-    диапазоны; позиции не двигаются, строка порции не перезаписывается;
-  - затронутые топики → затронутые staging-модели → `dbt run --select
-    stg_x+ …` (in-process dbtRunner, target/log в /tmp — репозиторий ro);
-    первая порция (`ctl.load_batches` пуст) идёт с `--full-refresh`;
-  - успех → строка `ctl.load_batches(status=success)` + продвижение
-    `ctl.kafka_positions`; также пересинхронизирует `ctl.receipt_pharmacy`
-    (обогащение `pharmacy_bk` чека — маршрут shift → cash_register →
-    pharmacy вне репликации) из `pos.contract.v_receipt`.
-
-Механика порций и идемпотентность — ADR-011.
+  с максимумами offsets в `raw.cdc_events` по всем 25 топикам;
+- `load_dds`: новая порция, retry и replay описаны в
+  [dwh/README.md](../dwh/README.md). Путь проходит только через raw и
+  Iceberg processed state. Связь аптеки — через CDC shift/cash_register,
+  без чтения PostgreSQL-контрактов. Первая порция создаёт все модели,
+  дельта обновляет затронутые ветки и ключи.
 
 ---
 

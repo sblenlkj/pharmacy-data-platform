@@ -45,6 +45,8 @@ kafka:
     pos.public.pharmacy: {service: pos, table: public.pharmacy}
     pos.public.receipt: {service: pos, table: public.receipt}
     pos.public.receipt_line: {service: pos, table: public.receipt_line}
+    pos.public.shift: {service: pos, table: public.shift}
+    pos.public.cash_register: {service: pos, table: public.cash_register}
     wms.public.supplier: {service: wms, table: public.supplier}
     wms.public.distribution_center: {service: wms, table: public.distribution_center}
     wms.public.purchase_order: {service: wms, table: public.purchase_order}
@@ -53,5 +55,5 @@ kafka:
     wms.public.movement: {service: wms, table: public.movement}
 
 commands:
-  fixture: [./scripts/check_fixture]
-  load: [./scripts/load_dds]
+  fixture: [python, scripts/check_fixture]
+  load: [python, scripts/load_dds]

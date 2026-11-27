@@ -1,0 +1,171 @@
+{
+  "checks": {
+    "dds.sales": {
+      "status": "pass",
+      "points": 1,
+      "max": 1,
+      "detail": "v_sale_line"
+    },
+    "dds.purchases": {
+      "status": "pass",
+      "points": 1,
+      "max": 1,
+      "detail": "v_purchase_line"
+    },
+    "dds.movements": {
+      "status": "pass",
+      "points": 1,
+      "max": 1,
+      "detail": "v_movement"
+    },
+    "dds.dimensions": {
+      "status": "pass",
+      "points": 1,
+      "max": 1,
+      "detail": "v_sku, v_customer, v_pharmacy, v_batch, v_supplier, v_distribution_center"
+    },
+    "cdc.crm.snapshot": {
+      "status": "pass",
+      "points": 0.5,
+      "max": 0.5,
+      "detail": "8952 записей snapshot в raw"
+    },
+    "cdc.catalog.snapshot": {
+      "status": "pass",
+      "points": 0.5,
+      "max": 0.5,
+      "detail": "3532 записей snapshot в raw"
+    },
+    "cdc.pos.snapshot": {
+      "status": "pass",
+      "points": 0.5,
+      "max": 0.5,
+      "detail": "85158 записей snapshot в raw"
+    },
+    "cdc.wms.snapshot": {
+      "status": "pass",
+      "points": 0.5,
+      "max": 0.5,
+      "detail": "102663 записей snapshot в raw"
+    },
+    "cdc.crm.delta": {
+      "status": "pass",
+      "points": 0.5,
+      "max": 0.5,
+      "detail": "ожидалось 2; в Kafka 2; в raw 2"
+    },
+    "cdc.catalog.delta": {
+      "status": "pass",
+      "points": 0.5,
+      "max": 0.5,
+      "detail": "ожидалось 3; в Kafka 3; в raw 3"
+    },
+    "cdc.pos.delta": {
+      "status": "pass",
+      "points": 0.5,
+      "max": 0.5,
+      "detail": "ожидалось 2; в Kafka 2; в raw 2"
+    },
+    "cdc.wms.delta": {
+      "status": "pass",
+      "points": 0.5,
+      "max": 0.5,
+      "detail": "ожидалось 4; в Kafka 4; в raw 4"
+    },
+    "incremental.delta": {
+      "status": "pass",
+      "points": 1,
+      "max": 1,
+      "detail": "Новые ключи совпали с источниками, связи проверены"
+    },
+    "incremental.replay": {
+      "status": "pass",
+      "points": 1,
+      "max": 1,
+      "detail": "Данные и версии не изменились"
+    },
+    "incremental.batch_log": {
+      "status": "pass",
+      "points": 1,
+      "max": 1,
+      "detail": "Границы порции покрывают тестовые события и не изменились при повторе"
+    },
+    "history.versions": {
+      "status": "pass",
+      "points": 1,
+      "max": 1,
+      "detail": "Старые и новые версии доступны, снимок продажи прежний"
+    },
+    "history.privacy": {
+      "status": "pass",
+      "points": 1,
+      "max": 1,
+      "detail": "Клиент скрыт, позиции чеков и суммы сохранены"
+    },
+    "model.diagram": {
+      "status": "manual",
+      "points": null,
+      "max": 1,
+      "detail": "Проверяет преподаватель"
+    },
+    "model.dds": {
+      "status": "manual",
+      "points": null,
+      "max": 1,
+      "detail": "Проверяет преподаватель"
+    },
+    "model.mapping": {
+      "status": "manual",
+      "points": null,
+      "max": 1,
+      "detail": "Проверяет преподаватель"
+    },
+    "engine.start": {
+      "status": "manual",
+      "points": null,
+      "max": 1,
+      "detail": "Проверяет преподаватель"
+    },
+    "engine.initialize": {
+      "status": "manual",
+      "points": null,
+      "max": 1,
+      "detail": "Проверяет преподаватель"
+    },
+    "incremental.scope": {
+      "status": "manual",
+      "points": null,
+      "max": 1,
+      "detail": "Проверяет преподаватель"
+    },
+    "journal": {
+      "status": "manual",
+      "points": null,
+      "max": 1,
+      "detail": "Проверяет преподаватель"
+    },
+    "bonus.iceberg": {
+      "status": "manual",
+      "points": null,
+      "max": 2,
+      "detail": "Проверяет преподаватель"
+    },
+    "bonus.dbt": {
+      "status": "manual",
+      "points": null,
+      "max": 1,
+      "detail": "Проверяет преподаватель"
+    },
+    "bonus.solo": {
+      "status": "manual",
+      "points": null,
+      "max": 2,
+      "detail": "Проверяет преподаватель"
+    }
+  },
+  "automatic_points": 13.0,
+  "automatic_max": 13,
+  "manual_max": 7,
+  "bonus_max": 5,
+  "full_credit": 20
+}
